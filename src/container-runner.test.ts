@@ -16,6 +16,18 @@ vi.mock('./config.js', () => ({
   IDLE_TIMEOUT: 1800000, // 30min
 }));
 
+// Mock container-runtime (default to Apple Container behavior)
+vi.mock('./container-runtime.js', () => ({
+  getRuntimeBinary: vi.fn(() => 'container'),
+  buildMountArg: vi.fn((mount: { hostPath: string; containerPath: string; readonly: boolean }) => {
+    if (mount.readonly) {
+      return ['--mount', `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`];
+    }
+    return ['-v', `${mount.hostPath}:${mount.containerPath}`];
+  }),
+  stopContainerAsync: vi.fn(() => Promise.resolve()),
+}));
+
 // Mock logger
 vi.mock('./logger.js', () => ({
   logger: {
@@ -74,10 +86,6 @@ vi.mock('child_process', async () => {
   return {
     ...actual,
     spawn: vi.fn(() => fakeProc),
-    exec: vi.fn((_cmd: string, _opts: unknown, cb?: (err: Error | null) => void) => {
-      if (cb) cb(null);
-      return new EventEmitter();
-    }),
   };
 });
 

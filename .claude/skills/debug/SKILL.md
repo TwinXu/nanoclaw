@@ -10,11 +10,11 @@ This guide covers debugging the containerized agent execution system.
 ## Architecture Overview
 
 ```
-Host (macOS)                          Container (Linux VM)
+Host (macOS / Linux)                  Container (Linux VM)
 ─────────────────────────────────────────────────────────────
 src/container-runner.ts               container/agent-runner/
     │                                      │
-    │ spawns Apple Container               │ runs Claude Agent SDK
+    │ spawns container (auto-detected)     │ runs Claude Agent SDK
     │ with volume mounts                   │ with MCP servers
     │                                      │
     ├── data/env/env ──────────────> /workspace/env-dir/env
@@ -23,6 +23,8 @@ src/container-runner.ts               container/agent-runner/
     ├── data/sessions/{folder}/.claude/ ──> /home/node/.claude/ (isolated per-group)
     └── (main only) project root ──> /workspace/project
 ```
+
+**Runtime detection:** NanoClaw auto-detects Apple Container or Docker via `src/container-runtime.ts`. Override with `CONTAINER_RUNTIME=apple-container` or `CONTAINER_RUNTIME=docker` env var.
 
 **Important:** The container runs as user `node` with `HOME=/home/node`. Session files must be mounted to `/home/node/.claude/` (not `/root/.claude/`) for session resumption to work.
 
@@ -84,10 +86,17 @@ cat .env  # Should show one of:
 
 **Workaround:** The system extracts only authentication variables (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`) from `.env` and mounts them for sourcing inside the container. Other env vars are not exposed.
 
-To verify env vars are reaching the container:
+To verify env vars are reaching the container (adjust command for your runtime):
 ```bash
+# Apple Container:
 echo '{}' | container run -i \
   --mount type=bind,source=$(pwd)/data/env,target=/workspace/env-dir,readonly \
+  --entrypoint /bin/bash nanoclaw-agent:latest \
+  -c 'export $(cat /workspace/env-dir/env | xargs); echo "OAuth: ${#CLAUDE_CODE_OAUTH_TOKEN} chars, API: ${#ANTHROPIC_API_KEY} chars"'
+
+# Docker:
+echo '{}' | docker run -i \
+  -v $(pwd)/data/env:/workspace/env-dir:ro \
   --entrypoint /bin/bash nanoclaw-agent:latest \
   -c 'export $(cat /workspace/env-dir/env | xargs); echo "OAuth: ${#CLAUDE_CODE_OAUTH_TOKEN} chars, API: ${#ANTHROPIC_API_KEY} chars"'
 ```
@@ -105,9 +114,18 @@ echo '{}' | container run -i \
   -v /path:/container/path
   ```
 
+**Docker mount syntax:**
+- `-v /path:/container/path:ro` for readonly
+- `-v /path:/container/path` for read-write
+
+NanoClaw handles this automatically via `src/container-runtime.ts`.
+
 To check what's mounted inside a container:
 ```bash
+# Use whichever runtime you have:
 container run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c 'ls -la /workspace/'
+# or:
+docker run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c 'ls -la /workspace/'
 ```
 
 Expected structure:
@@ -129,6 +147,7 @@ Expected structure:
 
 The container runs as user `node` (uid 1000). Check ownership:
 ```bash
+# Use whichever runtime you have (container or docker):
 container run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c '
   whoami
   ls -la /workspace/
@@ -152,6 +171,7 @@ grep -A3 "Claude sessions" src/container-runner.ts
 
 **Verify sessions are accessible:**
 ```bash
+# Use whichever runtime you have (container or docker):
 container run --rm --entrypoint /bin/bash \
   -v ~/.claude:/home/node/.claude \
   nanoclaw-agent:latest -c '
@@ -175,16 +195,27 @@ If an MCP server fails to start, the agent may exit. Check the container logs fo
 
 ## Manual Container Testing
 
+Commands below use `container` (Apple Container). Replace with `docker` if using Docker. Mount syntax differs between runtimes — NanoClaw handles this automatically, but for manual testing:
+- Apple Container readonly: `--mount "type=bind,source=...,target=...,readonly"`
+- Docker readonly: `-v ...:...:ro`
+
 ### Test the full agent flow:
 ```bash
 # Set up env file
 mkdir -p data/env groups/test
-cp .env data/env/env
 
-# Run test query
+# Apple Container:
 echo '{"prompt":"What is 2+2?","groupFolder":"test","chatJid":"test@g.us","isMain":false}' | \
   container run -i \
   --mount "type=bind,source=$(pwd)/data/env,target=/workspace/env-dir,readonly" \
+  -v $(pwd)/groups/test:/workspace/group \
+  -v $(pwd)/data/ipc:/workspace/ipc \
+  nanoclaw-agent:latest
+
+# Docker:
+echo '{"prompt":"What is 2+2?","groupFolder":"test","chatJid":"test@g.us","isMain":false}' | \
+  docker run -i \
+  -v $(pwd)/data/env:/workspace/env-dir:ro \
   -v $(pwd)/groups/test:/workspace/group \
   -v $(pwd)/data/ipc:/workspace/ipc \
   nanoclaw-agent:latest
@@ -192,8 +223,17 @@ echo '{"prompt":"What is 2+2?","groupFolder":"test","chatJid":"test@g.us","isMai
 
 ### Test Claude Code directly:
 ```bash
+# Apple Container:
 container run --rm --entrypoint /bin/bash \
   --mount "type=bind,source=$(pwd)/data/env,target=/workspace/env-dir,readonly" \
+  nanoclaw-agent:latest -c '
+  export $(cat /workspace/env-dir/env | xargs)
+  claude -p "Say hello" --dangerously-skip-permissions --allowedTools ""
+'
+
+# Docker:
+docker run --rm --entrypoint /bin/bash \
+  -v $(pwd)/data/env:/workspace/env-dir:ro \
   nanoclaw-agent:latest -c '
   export $(cat /workspace/env-dir/env | xargs)
   claude -p "Say hello" --dangerously-skip-permissions --allowedTools ""
@@ -203,6 +243,8 @@ container run --rm --entrypoint /bin/bash \
 ### Interactive shell in container:
 ```bash
 container run --rm -it --entrypoint /bin/bash nanoclaw-agent:latest
+# or:
+docker run --rm -it --entrypoint /bin/bash nanoclaw-agent:latest
 ```
 
 ## SDK Options Reference
@@ -234,18 +276,23 @@ npm run build
 # Rebuild container (use --no-cache for clean rebuild)
 ./container/build.sh
 
-# Or force full rebuild
+# Or force full rebuild (Apple Container):
 container builder prune -af
+./container/build.sh
+
+# Or force full rebuild (Docker):
+docker builder prune -af
 ./container/build.sh
 ```
 
 ## Checking Container Image
 
 ```bash
-# List images
+# List images (use your runtime):
 container images
+# or: docker images
 
-# Check what's in the image
+# Check what's in the image:
 container run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c '
   echo "=== Node version ==="
   node --version
@@ -256,6 +303,7 @@ container run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c '
   echo "=== Installed packages ==="
   ls /app/node_modules/
 '
+# or replace "container" with "docker" above
 ```
 
 ## Session Persistence
@@ -326,11 +374,23 @@ echo -e "\n1. Authentication configured?"
 echo -e "\n2. Env file copied for container?"
 [ -f data/env/env ] && echo "OK" || echo "MISSING - will be created on first run"
 
-echo -e "\n3. Apple Container system running?"
-container system status &>/dev/null && echo "OK" || echo "NOT RUNNING - NanoClaw should auto-start it; check logs"
+echo -e "\n3. Container runtime available?"
+if command -v container &>/dev/null && container system status &>/dev/null; then
+  echo "OK (Apple Container)"
+elif command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+  echo "OK (Docker)"
+else
+  echo "NOT RUNNING - install Apple Container or Docker"
+fi
 
 echo -e "\n4. Container image exists?"
-echo '{}' | container run -i --entrypoint /bin/echo nanoclaw-agent:latest "OK" 2>/dev/null || echo "MISSING - run ./container/build.sh"
+if command -v container &>/dev/null; then
+  echo '{}' | container run -i --entrypoint /bin/echo nanoclaw-agent:latest "OK" 2>/dev/null || echo "MISSING - run ./container/build.sh"
+elif command -v docker &>/dev/null; then
+  echo '{}' | docker run -i --entrypoint /bin/echo nanoclaw-agent:latest "OK" 2>/dev/null || echo "MISSING - run ./container/build.sh"
+else
+  echo "SKIP - no runtime available"
+fi
 
 echo -e "\n5. Session mount path correct?"
 grep -q "/home/node/.claude" src/container-runner.ts 2>/dev/null && echo "OK" || echo "WRONG - should mount to /home/node/.claude/, not /root/.claude/"

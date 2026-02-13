@@ -25,32 +25,43 @@ which container && echo "Apple Container: installed" || echo "Apple Container: n
 which docker && docker info >/dev/null 2>&1 && echo "Docker: installed and running" || echo "Docker: not installed or not running"
 ```
 
+NanoClaw auto-detects the container runtime (Apple Container or Docker). At least one must be installed.
+
 ### If NOT on macOS (Linux, etc.)
 
-Apple Container is macOS-only. Use Docker instead.
+Apple Container is macOS-only. Install Docker:
 
 Tell the user:
-> You're on Linux, so we'll use Docker for container isolation. Let me set that up now.
+> You're on Linux, so we'll use Docker for container isolation.
+>
+> ```bash
+> curl -fsSL https://get.docker.com | sh
+> sudo systemctl start docker
+> sudo usermod -aG docker $USER  # Then log out and back in
+> ```
+>
+> Or install Docker Desktop from https://docker.com/products/docker-desktop
 
-**Use the `/convert-to-docker` skill** to convert the codebase to Docker, then continue to Section 3.
+Wait for confirmation, then verify:
+```bash
+docker run --rm hello-world
+```
 
 ### If on macOS
 
-**If Apple Container is already installed:** Continue to Section 3.
+**If Apple Container OR Docker is already installed:** Continue to Section 3.
 
-**If Apple Container is NOT installed:** Ask the user:
+**If neither is installed:** Ask the user:
 > NanoClaw needs a container runtime for isolated agent execution. You have two options:
 >
-> 1. **Apple Container** (default) - macOS-native, lightweight, designed for Apple silicon
-> 2. **Docker** - Cross-platform, widely used, works on macOS and Linux
+> 1. **Apple Container** (default) - macOS-native, lightweight, designed for Apple silicon (requires macOS 26+)
+> 2. **Docker** - Cross-platform, widely used (via Docker Desktop, OrbStack, or Colima)
 >
 > Which would you prefer?
 
 #### Option A: Apple Container
 
 Tell the user:
-> Apple Container is required for running agents in isolated environments.
->
 > 1. Download the latest `.pkg` from https://github.com/apple/container/releases
 > 2. Double-click to install
 > 3. Run `container system start` to start the service
@@ -64,14 +75,17 @@ container system start
 container --version
 ```
 
-**Note:** NanoClaw automatically starts the Apple Container system when it launches, so you don't need to start it manually after reboots.
-
 #### Option B: Docker
 
 Tell the user:
-> You've chosen Docker. Let me set that up now.
+> Download Docker Desktop from https://docker.com/products/docker-desktop (or install OrbStack/Colima).
+>
+> Let me know when Docker is installed and running.
 
-**Use the `/convert-to-docker` skill** to convert the codebase to Docker, then continue to Section 3.
+Wait for confirmation, then verify:
+```bash
+docker run --rm hello-world
+```
 
 ## 3. Configure Claude Authentication
 
@@ -575,7 +589,7 @@ The user should receive a response in WhatsApp.
 **Container agent fails with "Claude Code process exited with code 1"**:
 - Ensure the container runtime is running:
   - Apple Container: `container system start`
-  - Docker: `docker info` (start Docker Desktop on macOS, or `sudo systemctl start docker` on Linux)
+  - Docker: `docker info` (start Docker Desktop/OrbStack on macOS, or `sudo systemctl start docker` on Linux)
 - Check container logs: `cat groups/main/logs/container-*.log | tail -50`
 
 **No response to messages**:
