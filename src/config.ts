@@ -49,6 +49,14 @@ export const TRIGGER_PATTERN = new RegExp(
   'i',
 );
 
+// Feishu / Lark
+export const FEISHU_APP_ID = process.env.FEISHU_APP_ID || '';
+export const FEISHU_APP_SECRET = process.env.FEISHU_APP_SECRET || '';
+export const FEISHU_DOMAIN = process.env.FEISHU_DOMAIN || 'feishu'; // 'feishu' | 'lark'
+
+// Channel toggles
+export const WHATSAPP_DISABLED = process.env.WHATSAPP_DISABLED === 'true';
+
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default
 export const TIMEZONE =

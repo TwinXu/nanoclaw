@@ -4,11 +4,15 @@ import path from 'path';
 import {
   ASSISTANT_NAME,
   DATA_DIR,
+  FEISHU_APP_ID,
+  FEISHU_APP_SECRET,
   IDLE_TIMEOUT,
   MAIN_GROUP_FOLDER,
   POLL_INTERVAL,
   TRIGGER_PATTERN,
+  WHATSAPP_DISABLED,
 } from './config.js';
+import { FeishuChannel } from './channels/feishu.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import {
   ContainerOutput,
@@ -38,9 +42,9 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { startIpcWatcher } from './ipc.js';
-import { formatMessages, formatOutbound } from './router.js';
+import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { NewMessage, RegisteredGroup } from './types.js';
+import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -52,7 +56,7 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
-let whatsapp: WhatsAppChannel;
+const channels: Channel[] = [];
 const queue = new GroupQueue();
 
 function loadState(): void {
@@ -103,7 +107,7 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
   const registeredJids = new Set(Object.keys(registeredGroups));
 
   return chats
-    .filter((c) => c.jid !== '__group_sync__' && c.jid.endsWith('@g.us'))
+    .filter((c) => c.jid !== '__group_sync__' && channels.some((ch) => ch.ownsJid(c.jid)))
     .map((c) => ({
       jid: c.jid,
       name: c.name,
@@ -115,6 +119,12 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
 /** @internal - exported for testing */
 export function _setRegisteredGroups(groups: Record<string, RegisteredGroup>): void {
   registeredGroups = groups;
+}
+
+/** @internal - exported for testing */
+export function _setChannels(chs: Channel[]): void {
+  channels.length = 0;
+  channels.push(...chs);
 }
 
 /**
@@ -169,7 +179,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await whatsapp.setTyping(chatJid, true);
+  const ch = findChannel(channels, chatJid);
+  await ch?.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
 
@@ -180,9 +191,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
       const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
-      if (text) {
-        await whatsapp.sendMessage(chatJid, `${ASSISTANT_NAME}: ${text}`);
-        outputSentToUser = true;
+      if (text && ch) {
+        const formatted = formatOutbound(ch, raw);
+        if (formatted) {
+          await ch.sendMessage(chatJid, formatted);
+          outputSentToUser = true;
+        }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -193,7 +207,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   });
 
-  await whatsapp.setTyping(chatJid, false);
+  await ch?.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -426,21 +440,44 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     await queue.shutdown(10000);
-    await whatsapp.disconnect();
+    await Promise.all(channels.map((ch) => ch.disconnect()));
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  // Create WhatsApp channel
-  whatsapp = new WhatsAppChannel({
-    onMessage: (chatJid, msg) => storeMessage(msg),
-    onChatMetadata: (chatJid, timestamp) => storeChatMetadata(chatJid, timestamp),
-    registeredGroups: () => registeredGroups,
-  });
+  // --- Channel setup ---
 
-  // Connect — resolves when first connected
-  await whatsapp.connect();
+  const onMessage = (chatJid: string, msg: import('./types.js').NewMessage) => storeMessage(msg);
+  const onChatMetadata = (chatJid: string, timestamp: string, name?: string) =>
+    storeChatMetadata(chatJid, timestamp, name);
+
+  // WhatsApp (unless disabled)
+  if (!WHATSAPP_DISABLED) {
+    const whatsapp = new WhatsAppChannel({
+      onMessage,
+      onChatMetadata,
+      registeredGroups: () => registeredGroups,
+    });
+    channels.push(whatsapp);
+    await whatsapp.connect();
+  }
+
+  // Feishu (if credentials configured)
+  if (FEISHU_APP_ID && FEISHU_APP_SECRET) {
+    const feishu = new FeishuChannel({
+      onMessage,
+      onChatMetadata,
+      registeredGroups: () => registeredGroups,
+    });
+    channels.push(feishu);
+    await feishu.connect();
+  }
+
+  if (channels.length === 0) {
+    logger.error('No channels configured. Set WhatsApp or Feishu credentials.');
+    process.exit(1);
+  }
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
@@ -449,15 +486,24 @@ async function main(): Promise<void> {
     queue,
     onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
     sendMessage: async (jid, rawText) => {
-      const text = formatOutbound(whatsapp, rawText);
-      if (text) await whatsapp.sendMessage(jid, text);
+      const ch = findChannel(channels, jid);
+      if (ch) {
+        const text = formatOutbound(ch, rawText);
+        if (text) await ch.sendMessage(jid, text);
+      }
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => whatsapp.sendMessage(jid, text),
+    sendMessage: async (jid, text) => {
+      const ch = findChannel(channels, jid);
+      if (ch) await ch.sendMessage(jid, text);
+    },
     registeredGroups: () => registeredGroups,
     registerGroup,
-    syncGroupMetadata: (force) => whatsapp.syncGroupMetadata(force),
+    syncGroupMetadata: async (force) => {
+      const wa = channels.find((ch) => ch.name === 'whatsapp');
+      if (wa) await (wa as WhatsAppChannel).syncGroupMetadata(force);
+    },
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
   });
