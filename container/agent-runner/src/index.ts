@@ -517,6 +517,17 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
+  // Replace {{ASSISTANT_NAME}} placeholders in CLAUDE.md files
+  const assistantName = process.env.ASSISTANT_NAME || 'Andy';
+  for (const mdPath of ['/workspace/group/CLAUDE.md', '/workspace/global/CLAUDE.md']) {
+    if (fs.existsSync(mdPath)) {
+      const content = fs.readFileSync(mdPath, 'utf-8');
+      if (content.includes('{{ASSISTANT_NAME}}')) {
+        fs.writeFileSync(mdPath, content.replace(/\{\{ASSISTANT_NAME\}\}/g, assistantName));
+      }
+    }
+  }
+
   let sessionId = containerInput.sessionId;
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 

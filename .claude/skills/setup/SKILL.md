@@ -391,9 +391,41 @@ mkdir -p data
 
 Then write `data/registered_groups.json` with the correct JID, trigger, and timestamp.
 
-If the user chose a name other than `Andy`, also update:
-1. `groups/global/CLAUDE.md` - Change "# Andy" and "You are Andy" to the new name
-2. `groups/main/CLAUDE.md` - Same changes at the top
+Replace `{{ASSISTANT_NAME}}` placeholders in CLAUDE.md files with the user's chosen name:
+1. `groups/global/CLAUDE.md` - Replace all `{{ASSISTANT_NAME}}` with the chosen name
+2. `groups/main/CLAUDE.md` - Same replacements
+
+Replace the `<!-- {{MESSAGE_FORMATTING}} -->` comment and the generic text below it in both CLAUDE.md files with channel-appropriate formatting rules:
+
+**For WhatsApp:**
+```
+NEVER use markdown. Only use WhatsApp formatting:
+- *single asterisks* for bold (NEVER **double asterisks**)
+- _underscores_ for italic
+- • bullet points
+- ```triple backticks``` for code
+No ## headings. No [links](url). No **double stars**.
+```
+
+**For Feishu/Lark:**
+```
+Use plain text for Feishu messages. Keep it clean and readable:
+- Use **bold** sparingly for emphasis
+- Use bullet points (- or •) for lists
+- Use ``` for code blocks
+- Keep messages concise — avoid walls of text
+- No markdown headings (#) in messages
+```
+
+**For Telegram:**
+```
+Use Telegram-compatible formatting:
+- *bold* with single asterisks
+- _italic_ with underscores
+- `code` with backticks
+- ```code blocks``` with triple backticks
+Keep messages concise and readable.
+```
 
 Ensure the groups folder exists:
 ```bash
