@@ -523,7 +523,11 @@ async function main(): Promise<void> {
     if (fs.existsSync(mdPath)) {
       const content = fs.readFileSync(mdPath, 'utf-8');
       if (content.includes('{{ASSISTANT_NAME}}')) {
-        fs.writeFileSync(mdPath, content.replace(/\{\{ASSISTANT_NAME\}\}/g, assistantName));
+        try {
+          fs.writeFileSync(mdPath, content.replace(/\{\{ASSISTANT_NAME\}\}/g, assistantName));
+        } catch {
+          // Read-only mount (e.g., /workspace/global for non-main groups) — skip
+        }
       }
     }
   }

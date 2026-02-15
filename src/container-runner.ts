@@ -188,7 +188,7 @@ function readSecrets(): Record<string, string> {
   const envFile = path.join(process.cwd(), '.env');
   if (!fs.existsSync(envFile)) return {};
 
-  const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL', 'CLAUDE_MODEL', 'ASSISTANT_NAME'];
+  const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL', 'CLAUDE_MODEL', 'ASSISTANT_NAME', 'FEISHU_APP_ID', 'FEISHU_APP_SECRET', 'FEISHU_DOMAIN'];
   const secrets: Record<string, string> = {};
   const content = fs.readFileSync(envFile, 'utf-8');
 

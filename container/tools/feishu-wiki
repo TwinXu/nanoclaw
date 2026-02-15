@@ -1,0 +1,255 @@
+#!/usr/bin/env node
+// feishu-wiki — CLI tool to read Feishu/Lark wiki content
+// No npm dependencies; uses built-in fetch (Node 18+)
+
+const FEISHU_APP_ID = process.env.FEISHU_APP_ID;
+const FEISHU_APP_SECRET = process.env.FEISHU_APP_SECRET;
+const FEISHU_DOMAIN = process.env.FEISHU_DOMAIN; // "lark" for larksuite.com
+
+const BASE =
+  FEISHU_DOMAIN === 'lark'
+    ? 'https://open.larksuite.com'
+    : 'https://open.feishu.cn';
+
+// ─── Auth ────────────────────────────────────────────────────────────
+
+let _tokenCache = null;
+
+async function getTenantToken() {
+  if (_tokenCache && Date.now() < _tokenCache.expiresAt) {
+    return _tokenCache.token;
+  }
+  if (!FEISHU_APP_ID || !FEISHU_APP_SECRET) {
+    fatal('FEISHU_APP_ID and FEISHU_APP_SECRET must be set');
+  }
+  const res = await fetch(
+    `${BASE}/open-apis/auth/v3/tenant_access_token/internal`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        app_id: FEISHU_APP_ID,
+        app_secret: FEISHU_APP_SECRET,
+      }),
+    },
+  );
+  const data = await res.json();
+  if (data.code !== 0) {
+    fatal(`Auth failed (code ${data.code}): ${data.msg}`);
+  }
+  _tokenCache = {
+    token: data.tenant_access_token,
+    expiresAt: Date.now() + (data.expire - 60) * 1000,
+  };
+  return _tokenCache.token;
+}
+
+// ─── HTTP helpers ────────────────────────────────────────────────────
+
+async function api(path, opts = {}) {
+  const token = await getTenantToken();
+  const url = path.startsWith('http') ? path : `${BASE}${path}`;
+  const res = await fetch(url, {
+    ...opts,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      ...opts.headers,
+    },
+  });
+  const data = await res.json();
+  if (data.code !== 0) {
+    fatal(`API error (code ${data.code}): ${data.msg}\n  ${path}`);
+  }
+  return data.data;
+}
+
+async function paginated(path, itemsKey, params = {}) {
+  const items = [];
+  let pageToken = params.page_token || undefined;
+  do {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && k !== 'page_token') qs.set(k, String(v));
+    }
+    if (pageToken) qs.set('page_token', pageToken);
+    const sep = path.includes('?') ? '&' : '?';
+    const data = await api(`${path}${qs.toString() ? sep + qs : ''}`);
+    if (data[itemsKey]) items.push(...data[itemsKey]);
+    pageToken = data.has_more ? data.page_token : undefined;
+  } while (pageToken);
+  return items;
+}
+
+// ─── URL / token parsing ─────────────────────────────────────────────
+
+function parseUrlOrToken(input) {
+  // URL formats:
+  //   https://org.feishu.cn/wiki/ABC123
+  //   https://org.feishu.cn/wiki/ABC123?from=...
+  //   https://org.larksuite.com/wiki/ABC123
+  //   plain token: ABC123
+  const urlMatch = input.match(
+    /(?:feishu\.cn|larksuite\.com)\/wiki\/([A-Za-z0-9]+)/,
+  );
+  if (urlMatch) return urlMatch[1];
+  // Also handle /docx/ URLs
+  const docxMatch = input.match(
+    /(?:feishu\.cn|larksuite\.com)\/docx\/([A-Za-z0-9]+)/,
+  );
+  if (docxMatch) return docxMatch[1];
+  // Bare token
+  if (/^[A-Za-z0-9]+$/.test(input)) return input;
+  fatal(`Cannot parse token from: ${input}`);
+}
+
+// ─── API wrappers ────────────────────────────────────────────────────
+
+async function listSpaces() {
+  const spaces = await paginated('/open-apis/wiki/v2/spaces', 'items');
+  if (!spaces.length) {
+    console.log('No wiki spaces found.');
+    return;
+  }
+  console.log('Wiki spaces:\n');
+  for (const s of spaces) {
+    console.log(`  ${s.name}`);
+    console.log(`    ID: ${s.space_id}`);
+    if (s.description) console.log(`    Description: ${s.description}`);
+    console.log();
+  }
+}
+
+async function listNodes(spaceId, parentToken) {
+  const params = {};
+  if (parentToken) params.parent_node_token = parentToken;
+  const nodes = await paginated(
+    `/open-apis/wiki/v2/spaces/${spaceId}/nodes`,
+    'items',
+    params,
+  );
+  if (!nodes.length) {
+    console.log('No pages found.');
+    return;
+  }
+  const label = parentToken ? `Child pages of ${parentToken}` : `Pages in space ${spaceId}`;
+  console.log(`${label}:\n`);
+  for (const n of nodes) {
+    const type = n.obj_type || 'unknown';
+    console.log(`  ${n.title} [${type}]`);
+    console.log(`    Token: ${n.node_token}`);
+    if (n.obj_token) console.log(`    Doc token: ${n.obj_token}`);
+    if (n.has_child) console.log(`    Has children: yes`);
+    console.log();
+  }
+}
+
+async function getNode(token) {
+  const data = await api(
+    `/open-apis/wiki/v2/spaces/get_node?token=${encodeURIComponent(token)}`,
+  );
+  const n = data.node;
+  console.log(`Node: ${n.title}`);
+  console.log(`  Type: ${n.obj_type}`);
+  console.log(`  Token: ${n.node_token}`);
+  console.log(`  Doc token: ${n.obj_token}`);
+  console.log(`  Space ID: ${n.space_id}`);
+  if (n.parent_node_token) console.log(`  Parent: ${n.parent_node_token}`);
+  if (n.has_child) console.log(`  Has children: yes`);
+}
+
+async function readDocument(token) {
+  // First resolve the wiki node to get the actual document token and type
+  const data = await api(
+    `/open-apis/wiki/v2/spaces/get_node?token=${encodeURIComponent(token)}`,
+  );
+  const node = data.node;
+  const docToken = node.obj_token;
+  const docType = node.obj_type;
+
+  if (docType !== 'docx' && docType !== 'doc') {
+    fatal(
+      `Document type "${docType}" is not supported for reading. Only docx documents can be read as text.\n` +
+        `  Title: ${node.title}\n  Doc token: ${docToken}`,
+    );
+  }
+
+  // Read docx content
+  const content = await api(
+    `/open-apis/docx/v1/documents/${docToken}/raw_content`,
+  );
+  console.log(content.content);
+}
+
+// ─── CLI ─────────────────────────────────────────────────────────────
+
+function fatal(msg) {
+  console.error(`Error: ${msg}`);
+  process.exit(1);
+}
+
+function usage() {
+  console.log(`Usage:
+  feishu-wiki spaces                        List wiki spaces
+  feishu-wiki pages <space_id>              List top-level pages in a space
+  feishu-wiki pages <space_id> -p <token>   List child pages under a node
+  feishu-wiki read <url_or_token>           Read document content as plain text
+  feishu-wiki node <url_or_token>           Get node info (type, title, tokens)
+
+Environment:
+  FEISHU_APP_ID       Feishu app ID (required)
+  FEISHU_APP_SECRET   Feishu app secret (required)
+  FEISHU_DOMAIN       Set to "lark" for larksuite.com (default: feishu.cn)`);
+  process.exit(0);
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (!args.length) usage();
+
+  const cmd = args[0];
+
+  switch (cmd) {
+    case 'spaces':
+      await listSpaces();
+      break;
+
+    case 'pages': {
+      const spaceId = args[1];
+      if (!spaceId) fatal('Usage: feishu-wiki pages <space_id> [-p <parent_token>]');
+      const pIdx = args.indexOf('-p');
+      const parentToken = pIdx !== -1 ? args[pIdx + 1] : undefined;
+      await listNodes(spaceId, parentToken);
+      break;
+    }
+
+    case 'read': {
+      const input = args[1];
+      if (!input) fatal('Usage: feishu-wiki read <url_or_token>');
+      const token = parseUrlOrToken(input);
+      await readDocument(token);
+      break;
+    }
+
+    case 'node': {
+      const input = args[1];
+      if (!input) fatal('Usage: feishu-wiki node <url_or_token>');
+      const token = parseUrlOrToken(input);
+      await getNode(token);
+      break;
+    }
+
+    case 'help':
+    case '--help':
+    case '-h':
+      usage();
+      break;
+
+    default:
+      fatal(`Unknown command: ${cmd}\nRun "feishu-wiki help" for usage.`);
+  }
+}
+
+main().catch((err) => {
+  fatal(err.message || String(err));
+});

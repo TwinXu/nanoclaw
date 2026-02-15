@@ -32,6 +32,10 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # Install agent-browser and claude-code globally
 RUN npm install -g agent-browser @anthropic-ai/claude-code
 
+# Install CLI tools
+COPY tools/feishu-wiki /usr/local/bin/feishu-wiki
+RUN chmod +x /usr/local/bin/feishu-wiki
+
 # Create app directory
 WORKDIR /app
 
