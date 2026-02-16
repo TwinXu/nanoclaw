@@ -501,6 +501,15 @@ async function main(): Promise<void> {
       const ch = findChannel(channels, jid);
       if (ch) await ch.sendMessage(jid, text);
     },
+    sendImage: async (jid, filePath, caption) => {
+      const ch = findChannel(channels, jid);
+      if (ch?.sendImage) await ch.sendImage(jid, filePath, caption);
+    },
+    downloadMedia: async (chatJid, messageId, fileKey, destDir, requestId) => {
+      const ch = findChannel(channels, chatJid);
+      if (ch?.downloadMedia) return ch.downloadMedia(messageId, fileKey, destDir, requestId);
+      return null;
+    },
     registeredGroups: () => registeredGroups,
     registerGroup,
     syncGroupMetadata: async (force) => {

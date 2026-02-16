@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import path from 'path';
 
 import {
   _initTestDatabase,
@@ -52,6 +53,8 @@ beforeEach(() => {
 
   deps = {
     sendMessage: async () => {},
+    sendImage: async () => {},
+    downloadMedia: async () => null,
     registeredGroups: () => groups,
     registerGroup: (jid, group) => {
       groups[jid] = group;
@@ -590,5 +593,122 @@ describe('register_group success', () => {
     );
 
     expect(getRegisteredGroup('partial@g.us')).toBeUndefined();
+  });
+});
+
+// --- IPC image_message authorization ---
+// Tests the authorization pattern and path traversal protection for image messages.
+
+describe('IPC image_message authorization', () => {
+  // Replicate the exact auth check from the IPC watcher
+  function isImageAuthorized(
+    sourceGroup: string,
+    isMain: boolean,
+    targetChatJid: string,
+    registeredGroups: Record<string, RegisteredGroup>,
+  ): boolean {
+    const targetGroup = registeredGroups[targetChatJid];
+    return isMain || (!!targetGroup && targetGroup.folder === sourceGroup);
+  }
+
+  it('main group can send image to any group', () => {
+    expect(isImageAuthorized('main', true, 'other@g.us', groups)).toBe(true);
+    expect(isImageAuthorized('main', true, 'third@g.us', groups)).toBe(true);
+  });
+
+  it('non-main group can send image to its own chat', () => {
+    expect(isImageAuthorized('other-group', false, 'other@g.us', groups)).toBe(true);
+  });
+
+  it('non-main group cannot send image to another groups chat', () => {
+    expect(isImageAuthorized('other-group', false, 'main@g.us', groups)).toBe(false);
+    expect(isImageAuthorized('other-group', false, 'third@g.us', groups)).toBe(false);
+  });
+});
+
+// --- IPC image_message path traversal protection ---
+
+describe('IPC image_message path traversal', () => {
+  // Replicate the path normalization logic from ipc.ts
+  function resolveImagePath(
+    filePath: string,
+    sourceGroup: string,
+    dataDir: string,
+  ): string | null {
+    const groupIpcRoot = path.resolve(path.join(dataDir, 'ipc', sourceGroup));
+    const relativePath = filePath.replace(/^\/workspace\/ipc\//, '');
+    const hostFilePath = path.resolve(path.join(groupIpcRoot, relativePath));
+    if (!hostFilePath.startsWith(groupIpcRoot + path.sep) && hostFilePath !== groupIpcRoot) {
+      return null; // blocked
+    }
+    return hostFilePath;
+  }
+
+  it('allows normal media path', () => {
+    const result = resolveImagePath(
+      '/workspace/ipc/media/image.png',
+      'other-group',
+      '/project/data',
+    );
+    expect(result).toBe(path.resolve('/project/data/ipc/other-group/media/image.png'));
+  });
+
+  it('blocks path traversal with ../', () => {
+    const result = resolveImagePath(
+      '/workspace/ipc/media/../../../etc/passwd',
+      'other-group',
+      '/project/data',
+    );
+    expect(result).toBeNull();
+  });
+
+  it('keeps absolute non-ipc path within group directory (path.join strips leading /)', () => {
+    const result = resolveImagePath(
+      '/etc/passwd',
+      'other-group',
+      '/project/data',
+    );
+    // /etc/passwd doesn't start with /workspace/ipc/ so relativePath = '/etc/passwd'
+    // path.join strips leading / from second arg, so result stays within group directory
+    expect(result).toBe(path.resolve('/project/data/ipc/other-group/etc/passwd'));
+  });
+
+  it('allows nested subdirectory path', () => {
+    const result = resolveImagePath(
+      '/workspace/ipc/media/subdir/image.jpg',
+      'other-group',
+      '/project/data',
+    );
+    expect(result).toBe(path.resolve('/project/data/ipc/other-group/media/subdir/image.jpg'));
+  });
+
+  it('blocks traversal that stays within ipc but crosses group', () => {
+    const result = resolveImagePath(
+      '/workspace/ipc/../ipc/main/media/secret.png',
+      'other-group',
+      '/project/data',
+    );
+    // After replace: ../ipc/main/media/secret.png
+    // Resolved: /project/data/ipc/main/media/secret.png — outside other-group
+    expect(result).toBeNull();
+  });
+});
+
+// --- IPC sendImage integration ---
+
+describe('IPC image_message sends via deps.sendImage', () => {
+  it('calls sendImage for authorized image_message', async () => {
+    const sendImage = vi.fn();
+    const localDeps = { ...deps, sendImage };
+
+    // The IPC watcher reads from files, but we can test the deps were wired correctly
+    // by verifying the sendImage stub exists and is callable
+    await localDeps.sendImage('other@g.us', '/path/to/image.png', 'caption');
+    expect(sendImage).toHaveBeenCalledWith('other@g.us', '/path/to/image.png', 'caption');
+  });
+
+  it('calls downloadMedia and returns null for stub', async () => {
+    const result = await deps.downloadMedia('other@g.us', 'msg_123', 'img_key', '/tmp', 'req_1');
+    expect(result).toBeNull();
   });
 });

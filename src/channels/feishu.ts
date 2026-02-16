@@ -1,4 +1,6 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
+import fs from 'fs';
+import path from 'path';
 
 import {
   ASSISTANT_NAME,
@@ -173,6 +175,97 @@ export class FeishuChannel implements Channel {
     // WSClient doesn't expose a stop method — connection will be GC'd
   }
 
+  /** Download an image from a Feishu message to a local directory. */
+  async downloadMedia(
+    messageId: string,
+    fileKey: string,
+    destDir: string,
+    requestId: string,
+  ): Promise<string | null> {
+    try {
+      const resp = await this.client.im.messageResource.get({
+        path: { message_id: messageId, file_key: fileKey },
+        params: { type: 'image' },
+      });
+
+      // SDK returns { writeFile, getReadableStream, headers }
+      const contentType = String(resp.headers?.['content-type'] || '');
+      let ext = '.png';
+      if (contentType.includes('jpeg') || contentType.includes('jpg'))
+        ext = '.jpg';
+      else if (contentType.includes('gif')) ext = '.gif';
+      else if (contentType.includes('webp')) ext = '.webp';
+
+      const filename = `${requestId}${ext}`;
+      const destPath = path.join(destDir, filename);
+
+      await resp.writeFile(destPath);
+
+      logger.info(
+        { messageId, fileKey, destPath },
+        'Feishu media downloaded',
+      );
+      return filename;
+    } catch (err) {
+      logger.error(
+        { messageId, fileKey, err },
+        'Failed to download Feishu media',
+      );
+      return null;
+    }
+  }
+
+  /** Upload and send an image file to a Feishu chat. */
+  async sendImage(
+    jid: string,
+    filePath: string,
+    caption?: string,
+  ): Promise<void> {
+    const chatId = jid.replace(/@feishu$/, '');
+
+    try {
+      // Upload image to get image_key
+      const uploadResp = await this.client.im.image.create({
+        data: {
+          image_type: 'message',
+          image: fs.createReadStream(filePath),
+        },
+      });
+
+      const imageKey = (uploadResp as unknown as { data?: { image_key?: string } })?.data?.image_key;
+      if (!imageKey) {
+        logger.error({ filePath }, 'Feishu image upload returned no image_key');
+        return;
+      }
+
+      // Send image message
+      await this.client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          content: JSON.stringify({ image_key: imageKey }),
+          msg_type: 'image',
+        },
+      });
+
+      logger.info({ jid, imageKey }, 'Feishu image sent');
+
+      // Send caption as a follow-up text message if provided
+      if (caption) {
+        await this.client.im.message.create({
+          params: { receive_id_type: 'chat_id' },
+          data: {
+            receive_id: chatId,
+            content: JSON.stringify({ text: caption }),
+            msg_type: 'text',
+          },
+        });
+      }
+    } catch (err) {
+      logger.error({ jid, filePath, err }, 'Failed to send Feishu image');
+    }
+  }
+
   // --- Internal ---
 
   private async handleMessage(event: FeishuMessageEvent): Promise<void> {
@@ -192,8 +285,18 @@ export class FeishuChannel implements Channel {
     const jid = `${msg.chat_id}@feishu`;
     const timestamp = new Date().toISOString();
 
-    // Extract text content
-    const rawContent = this.parseMessageContent(msg.content, msg.message_type);
+    // Extract text content — image messages get a metadata reference instead of placeholder
+    let rawContent: string;
+    if (msg.message_type === 'image') {
+      try {
+        const parsed = JSON.parse(msg.content);
+        rawContent = `[图片 image_key=${parsed.image_key} message_id=${msg.message_id}]`;
+      } catch {
+        rawContent = '[image message]';
+      }
+    } else {
+      rawContent = this.parseMessageContent(msg.content, msg.message_type);
+    }
 
     // Process mentions: replace bot mention with @AssistantName, others with @Name
     const content = this.processMentions(rawContent, msg.mentions);

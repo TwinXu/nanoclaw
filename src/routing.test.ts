@@ -1,11 +1,23 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 
 import { _initTestDatabase, getAllChats, storeChatMetadata } from './db.js';
-import { getAvailableGroups, _setRegisteredGroups } from './index.js';
+import { getAvailableGroups, _setRegisteredGroups, _setChannels } from './index.js';
+import type { Channel } from './types.js';
+
+// Minimal mock channel that owns @g.us JIDs (WhatsApp-like)
+const mockChannel: Channel = {
+  name: 'mock',
+  ownsJid: (jid: string) => jid.endsWith('@g.us'),
+  isConnected: () => true,
+  connect: async () => {},
+  disconnect: async () => {},
+  sendMessage: async () => {},
+};
 
 beforeEach(() => {
   _initTestDatabase();
   _setRegisteredGroups({});
+  _setChannels([mockChannel]);
 });
 
 // --- JID ownership patterns ---

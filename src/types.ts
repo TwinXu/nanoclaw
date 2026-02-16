@@ -90,6 +90,10 @@ export interface Channel {
   // Telegram bots already display their name, so they return false.
   // WhatsApp returns true. Default true if not implemented.
   prefixAssistantName?: boolean;
+  // Optional: send an image file to a chat.
+  sendImage?(jid: string, filePath: string, caption?: string): Promise<void>;
+  // Optional: download media (e.g. image) from a message to a local directory.
+  downloadMedia?(messageId: string, fileKey: string, destDir: string, requestId: string): Promise<string | null>;
 }
 
 // Callback type that channels use to deliver inbound messages

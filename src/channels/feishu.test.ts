@@ -448,6 +448,46 @@ describe('FeishuChannel', () => {
         }),
       );
     });
+    it('delivers image message with metadata reference', async () => {
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        chatId: 'oc_abc123',
+        messageType: 'image',
+        content: '{"image_key":"img_v3_abc123"}',
+        messageId: 'msg_img_1',
+      });
+      await registeredHandler!(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'oc_abc123@feishu',
+        expect.objectContaining({
+          content: '[图片 image_key=img_v3_abc123 message_id=msg_img_1]',
+        }),
+      );
+    });
+
+    it('falls back to placeholder for image with malformed JSON', async () => {
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        chatId: 'oc_abc123',
+        messageType: 'image',
+        content: 'not-json',
+      });
+      await registeredHandler!(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'oc_abc123@feishu',
+        expect.objectContaining({
+          content: '[image message]',
+        }),
+      );
+    });
   });
 
   // --- Deduplication ---

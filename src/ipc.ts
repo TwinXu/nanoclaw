@@ -17,6 +17,8 @@ import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendImage: (jid: string, filePath: string, caption?: string) => Promise<void>;
+  downloadMedia: (chatJid: string, messageId: string, fileKey: string, destDir: string, requestId: string) => Promise<string | null>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
@@ -30,6 +32,8 @@ export interface IpcDeps {
 }
 
 let ipcWatcherRunning = false;
+const MEDIA_CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+let lastMediaCleanup = 0;
 
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
@@ -61,6 +65,8 @@ export function startIpcWatcher(deps: IpcDeps): void {
       const isMain = sourceGroup === MAIN_GROUP_FOLDER;
       const messagesDir = path.join(ipcBaseDir, sourceGroup, 'messages');
       const tasksDir = path.join(ipcBaseDir, sourceGroup, 'tasks');
+      const mediaRequestsDir = path.join(ipcBaseDir, sourceGroup, 'media-requests');
+      const mediaDir = path.join(ipcBaseDir, sourceGroup, 'media');
 
       // Process messages from this group's IPC directory
       try {
@@ -93,6 +99,36 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     'Unauthorized IPC message attempt blocked',
                   );
                 }
+              } else if (data.type === 'image_message' && data.chatJid && data.filePath) {
+                // Agent sending an image — translate container path to host path
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  // Container path: /workspace/ipc/... → Host path: data/ipc/{sourceGroup}/...
+                  // Normalize to prevent path traversal (e.g., ../../../etc/passwd)
+                  const groupIpcRoot = path.resolve(path.join(DATA_DIR, 'ipc', sourceGroup));
+                  const relativePath = data.filePath.replace(/^\/workspace\/ipc\//, '');
+                  const hostFilePath = path.resolve(path.join(groupIpcRoot, relativePath));
+                  if (!hostFilePath.startsWith(groupIpcRoot + path.sep) && hostFilePath !== groupIpcRoot) {
+                    logger.warn(
+                      { chatJid: data.chatJid, sourceGroup, filePath: data.filePath },
+                      'IPC image path traversal attempt blocked',
+                    );
+                  } else {
+                    await deps.sendImage(data.chatJid, hostFilePath, data.caption);
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup, filePath: hostFilePath },
+                      'IPC image message sent',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC image message attempt blocked',
+                  );
+                }
               }
               fs.unlinkSync(filePath);
             } catch (err) {
@@ -114,6 +150,90 @@ export function startIpcWatcher(deps: IpcDeps): void {
           { err, sourceGroup },
           'Error reading IPC messages directory',
         );
+      }
+
+      // Process media download requests from this group's IPC directory
+      try {
+        if (fs.existsSync(mediaRequestsDir)) {
+          const requestFiles = fs
+            .readdirSync(mediaRequestsDir)
+            .filter((f) => f.endsWith('.json'));
+          for (const file of requestFiles) {
+            const filePath = path.join(mediaRequestsDir, file);
+            try {
+              const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+              if (data.type === 'media_request' && data.requestId && data.messageId && data.imageKey) {
+                if (!data.chatJid) {
+                  logger.warn({ sourceGroup, requestId: data.requestId }, 'Media request missing chatJid');
+                  // Write error so agent doesn't hang waiting
+                  const errorFile = path.join(mediaDir, `${data.requestId}.error`);
+                  fs.mkdirSync(mediaDir, { recursive: true });
+                  fs.writeFileSync(errorFile, JSON.stringify({ error: 'Missing chatJid in request' }));
+                } else {
+                  const destDir = mediaDir;
+                  fs.mkdirSync(destDir, { recursive: true });
+                  const result = await deps.downloadMedia(
+                    data.chatJid,
+                    data.messageId,
+                    data.imageKey,
+                    destDir,
+                    data.requestId,
+                  );
+                  if (!result) {
+                    // Write error file so the agent's polling loop can detect it
+                    const errorFile = path.join(destDir, `${data.requestId}.error`);
+                    fs.writeFileSync(errorFile, JSON.stringify({
+                      error: 'Download failed',
+                      messageId: data.messageId,
+                      imageKey: data.imageKey,
+                    }));
+                  }
+                }
+              }
+              fs.unlinkSync(filePath);
+            } catch (err) {
+              logger.error(
+                { file, sourceGroup, err },
+                'Error processing IPC media request',
+              );
+              const errorDir = path.join(ipcBaseDir, 'errors');
+              fs.mkdirSync(errorDir, { recursive: true });
+              fs.renameSync(
+                filePath,
+                path.join(errorDir, `${sourceGroup}-${file}`),
+              );
+            }
+          }
+        }
+      } catch (err) {
+        logger.error(
+          { err, sourceGroup },
+          'Error reading IPC media-requests directory',
+        );
+      }
+
+      // Clean up old media files (older than 24 hours), rate-limited to once per hour
+      if (Date.now() - lastMediaCleanup > MEDIA_CLEANUP_INTERVAL_MS) {
+        try {
+          if (fs.existsSync(mediaDir)) {
+            const now = Date.now();
+            const maxAge = 24 * 60 * 60 * 1000;
+            for (const file of fs.readdirSync(mediaDir)) {
+              const filePath = path.join(mediaDir, file);
+              try {
+                const stat = fs.statSync(filePath);
+                if (now - stat.mtimeMs > maxAge) {
+                  fs.unlinkSync(filePath);
+                }
+              } catch {
+                // ignore stat/unlink errors for individual files
+              }
+            }
+          }
+        } catch {
+          // ignore cleanup errors
+        }
+        lastMediaCleanup = Date.now();
       }
 
       // Process tasks from this group's IPC directory

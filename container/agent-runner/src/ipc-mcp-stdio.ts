@@ -14,6 +14,8 @@ import { CronExpressionParser } from 'cron-parser';
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const MEDIA_REQUESTS_DIR = path.join(IPC_DIR, 'media-requests');
+const MEDIA_DIR = path.join(IPC_DIR, 'media');
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -235,6 +237,125 @@ server.tool(
     writeIpcFile(TASKS_DIR, data);
 
     return { content: [{ type: 'text' as const, text: `Task ${args.task_id} cancellation requested.` }] };
+  },
+);
+
+server.tool(
+  'view_image',
+  `Request an image from the user's message for viewing. When you see a message like "[图片 image_key=xxx message_id=yyy]", use this tool with the image_key and message_id values. The image will be downloaded to /workspace/ipc/media/ and you can then use the Read tool to view it.`,
+  {
+    message_id: z.string().describe('The message_id from the image reference'),
+    image_key: z.string().describe('The image_key from the image reference'),
+  },
+  async (args) => {
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // Write download request for the host
+    const requestData = {
+      type: 'media_request',
+      requestId,
+      messageId: args.message_id,
+      imageKey: args.image_key,
+      chatJid,
+    };
+
+    fs.mkdirSync(MEDIA_REQUESTS_DIR, { recursive: true });
+    const requestFile = path.join(MEDIA_REQUESTS_DIR, `${requestId}.json`);
+    const tempFile = `${requestFile}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(requestData, null, 2));
+    fs.renameSync(tempFile, requestFile);
+
+    // Poll for the downloaded file (host writes to media/{requestId}.*)
+    const POLL_INTERVAL_MS = 300;
+    const POLL_TIMEOUT_MS = 15000;
+    const start = Date.now();
+
+    while (Date.now() - start < POLL_TIMEOUT_MS) {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+
+      try {
+        const files = fs.readdirSync(MEDIA_DIR);
+
+        // Check for error file first
+        const errorFile = files.find((f) => f === `${requestId}.error`);
+        if (errorFile) {
+          let errorMsg = 'Download failed';
+          try {
+            const errData = JSON.parse(fs.readFileSync(path.join(MEDIA_DIR, errorFile), 'utf-8'));
+            errorMsg = errData.error || errorMsg;
+          } catch { /* use default */ }
+          return {
+            content: [{
+              type: 'text' as const,
+              text: `Image download failed: ${errorMsg}. The message may have expired or the image may not be accessible.`,
+            }],
+            isError: true,
+          };
+        }
+
+        // Check for downloaded image file
+        const match = files.find((f) => f.startsWith(requestId) && !f.endsWith('.error'));
+        if (match) {
+          const filePath = path.join(MEDIA_DIR, match);
+          return {
+            content: [{
+              type: 'text' as const,
+              text: `Image downloaded to ${filePath}\nUse the Read tool to view this image file.`,
+            }],
+          };
+        }
+      } catch {
+        // media dir may not exist yet
+      }
+    }
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: 'Timed out waiting for image download. The image may not be available.',
+      }],
+      isError: true,
+    };
+  },
+);
+
+server.tool(
+  'send_image',
+  `Send an image file to the current chat. The file must exist on the filesystem (e.g., a file you created or downloaded). Files are sent via the host, so they must be under /workspace/ipc/ to be accessible.`,
+  {
+    file_path: z.string().describe('Absolute path to the image file to send'),
+    caption: z.string().optional().describe('Optional caption text to send with the image'),
+  },
+  async (args) => {
+    if (!fs.existsSync(args.file_path)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${args.file_path}` }],
+        isError: true,
+      };
+    }
+
+    // If file is not under /workspace/ipc/, copy it to media/ so host can access it
+    let filePath = args.file_path;
+    if (!filePath.startsWith('/workspace/ipc/')) {
+      fs.mkdirSync(MEDIA_DIR, { recursive: true });
+      const basename = path.basename(filePath);
+      const destPath = path.join(MEDIA_DIR, `send-${Date.now()}-${basename}`);
+      fs.copyFileSync(filePath, destPath);
+      filePath = destPath;
+    }
+
+    const data: Record<string, string | undefined> = {
+      type: 'image_message',
+      chatJid,
+      filePath,
+      caption: args.caption || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: 'Image sent.' }] };
   },
 );
 
