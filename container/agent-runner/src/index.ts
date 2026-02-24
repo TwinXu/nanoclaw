@@ -508,8 +508,19 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Build SDK env: merge secrets into process.env for the SDK only.
-  // Secrets never touch process.env itself, so Bash subprocesses can't see them.
+  // Set API auth secrets in process.env so the SDK's API client can see them.
+  // The SDK's `env` option only affects tool subprocesses, not the API client
+  // which reads directly from process.env.
+  const API_ENV_KEYS = new Set([
+    'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_MODEL', 'CLAUDE_MODEL', 'CLAUDE_CODE_OAUTH_TOKEN',
+  ]);
+  for (const [key, value] of Object.entries(containerInput.secrets || {})) {
+    if (API_ENV_KEYS.has(key)) {
+      process.env[key] = value;
+    }
+  }
+  // Build SDK env: merge ALL secrets for tool subprocess environments.
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
   for (const [key, value] of Object.entries(containerInput.secrets || {})) {
     sdkEnv[key] = value;
