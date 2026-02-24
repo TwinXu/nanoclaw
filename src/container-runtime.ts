@@ -235,6 +235,25 @@ export function stopContainerAsync(
   });
 }
 
+/** Kill orphaned NanoClaw containers from previous runs. */
+export function cleanupOrphans(): void {
+  try {
+    const orphans = listRunningContainers('nanoclaw-')
+      .filter((c) => c.status === 'running' || c.status.startsWith('Up'));
+    for (const { name } of orphans) {
+      stopContainer(name);
+    }
+    if (orphans.length > 0) {
+      logger.info(
+        { count: orphans.length, names: orphans.map((c) => c.name) },
+        'Stopped orphaned containers',
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Failed to clean up orphaned containers');
+  }
+}
+
 /** Reset cached runtime (for testing) */
 export function _resetRuntimeCache(): void {
   cachedRuntime = null;

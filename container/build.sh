@@ -8,6 +8,7 @@ cd "$SCRIPT_DIR"
 
 IMAGE_NAME="nanoclaw-agent"
 TAG="${1:-latest}"
+CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-docker}"
 
 # Detect container runtime
 if [ -n "$CONTAINER_RUNTIME" ]; then

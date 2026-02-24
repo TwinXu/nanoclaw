@@ -34,4 +34,7 @@ groups/global/*
 # BMAD
 _bmad/
 
+# Skills system (local per-installation state)
+.nanoclaw/
+
 agents-sdk-docs

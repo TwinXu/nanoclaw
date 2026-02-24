@@ -32,8 +32,10 @@ import {
   listRunningContainers,
   stopContainer,
   stopContainerAsync,
+  cleanupOrphans,
   _resetRuntimeCache,
 } from './container-runtime.js';
+import { logger } from './logger.js';
 
 describe('container-runtime', () => {
   beforeEach(() => {
@@ -333,6 +335,51 @@ describe('container-runtime', () => {
         expect.objectContaining({ timeout: 5000 }),
         expect.any(Function),
       );
+    });
+  });
+
+  describe('cleanupOrphans', () => {
+    it('stops running orphaned containers', () => {
+      process.env.CONTAINER_RUNTIME = 'docker';
+      mockExecFileSync.mockReturnValueOnce(
+        'nanoclaw-group1-111\tUp 5 minutes\nnanoclaw-group2-222\tUp 10 minutes\n',
+      );
+      // stop calls succeed
+      mockExecFileSync.mockReturnValue('');
+
+      cleanupOrphans();
+
+      // listRunningContainers + 2 stop calls
+      expect(mockExecFileSync).toHaveBeenCalledTimes(3);
+      expect(logger.info).toHaveBeenCalledWith(
+        { count: 2, names: ['nanoclaw-group1-111', 'nanoclaw-group2-222'] },
+        'Stopped orphaned containers',
+      );
+    });
+
+    it('does nothing when no orphans exist', () => {
+      process.env.CONTAINER_RUNTIME = 'docker';
+      mockExecFileSync.mockReturnValueOnce('');
+      vi.mocked(logger.info).mockClear();
+
+      cleanupOrphans();
+
+      expect(mockExecFileSync).toHaveBeenCalledTimes(1);
+      expect(logger.info).not.toHaveBeenCalledWith(
+        expect.objectContaining({ count: expect.any(Number) }),
+        'Stopped orphaned containers',
+      );
+    });
+
+    it('warns and continues when listing fails', () => {
+      process.env.CONTAINER_RUNTIME = 'docker';
+      // listRunningContainers returns [] on error internally,
+      // so cleanupOrphans won't see any orphans
+      mockExecFileSync.mockImplementationOnce(() => {
+        throw new Error('docker not available');
+      });
+
+      cleanupOrphans(); // should not throw
     });
   });
 });

@@ -83,27 +83,18 @@ describe('multi-channel routing', () => {
   });
 
   describe('formatOutbound', () => {
-    it('prefixes assistant name for WhatsApp', () => {
-      const wa = createWhatsAppChannel();
-      const result = formatOutbound(wa, 'Hello');
-      expect(result).toBe('Andy: Hello');
-    });
-
-    it('does not prefix assistant name for Feishu', () => {
-      const feishu = createFeishuChannel();
-      const result = formatOutbound(feishu, 'Hello');
+    it('returns text as-is', () => {
+      const result = formatOutbound('Hello');
       expect(result).toBe('Hello');
     });
 
     it('strips internal tags before formatting', () => {
-      const feishu = createFeishuChannel();
-      const result = formatOutbound(feishu, '<internal>thinking</internal>Result here');
+      const result = formatOutbound('<internal>thinking</internal>Result here');
       expect(result).toBe('Result here');
     });
 
     it('returns empty string for internal-only output', () => {
-      const wa = createWhatsAppChannel();
-      const result = formatOutbound(wa, '<internal>just thinking</internal>');
+      const result = formatOutbound('<internal>just thinking</internal>');
       expect(result).toBe('');
     });
   });

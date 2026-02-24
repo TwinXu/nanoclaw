@@ -45,9 +45,11 @@ Set `LOG_LEVEL=debug` for verbose output:
 # For development
 LOG_LEVEL=debug npm run dev
 
-# For launchd service, add to plist EnvironmentVariables:
+# For launchd service (macOS), add to plist EnvironmentVariables:
 <key>LOG_LEVEL</key>
 <string>debug</string>
+# For systemd service (Linux), add to unit [Service] section:
+# Environment=LOG_LEVEL=debug
 ```
 
 Debug level shows:
@@ -82,7 +84,7 @@ cat .env  # Should show one of:
 
 ### 2. Environment Variables Not Passing
 
-**Apple Container Bug:** Environment variables passed via `-e` are lost when using `-i` (interactive/piped stdin).
+**Runtime note:** Environment variables passed via `-e` may be lost when using `-i` (interactive/piped stdin).
 
 **Workaround:** The system extracts only authentication variables (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`) from `.env` and mounts them for sourcing inside the container. Other env vars are not exposed.
 
@@ -103,14 +105,14 @@ echo '{}' | docker run -i \
 
 ### 3. Mount Issues
 
-**Apple Container quirks:**
-- Only mounts directories, not individual files
-- `-v` syntax does NOT support `:ro` suffix - use `--mount` for readonly:
+**Container mount notes:**
+- Docker supports both `-v` and `--mount` syntax
+- Use `:ro` suffix for readonly mounts:
   ```bash
-  # Readonly: use --mount
-  --mount "type=bind,source=/path,target=/container/path,readonly"
+  # Readonly
+  -v /path:/container/path:ro
 
-  # Read-write: use -v
+  # Read-write
   -v /path:/container/path
   ```
 
@@ -122,7 +124,7 @@ NanoClaw handles this automatically via `src/container-runtime.ts`.
 
 To check what's mounted inside a container:
 ```bash
-# Use whichever runtime you have:
+# Use whichever runtime you have (use "container" for Apple Container):
 container run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c 'ls -la /workspace/'
 # or:
 docker run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c 'ls -la /workspace/'
@@ -147,8 +149,14 @@ Expected structure:
 
 The container runs as user `node` (uid 1000). Check ownership:
 ```bash
-# Use whichever runtime you have (container or docker):
+# Use whichever runtime you have (use "container" for Apple Container):
 container run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c '
+  whoami
+  ls -la /workspace/
+  ls -la /app/
+'
+# or:
+docker run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c '
   whoami
   ls -la /workspace/
   ls -la /app/
@@ -171,8 +179,16 @@ grep -A3 "Claude sessions" src/container-runner.ts
 
 **Verify sessions are accessible:**
 ```bash
-# Use whichever runtime you have (container or docker):
+# Use whichever runtime you have (use "container" for Apple Container):
 container run --rm --entrypoint /bin/bash \
+  --mount "type=bind,source=$HOME/.claude,target=/home/node/.claude,readonly" \
+  nanoclaw-agent:latest -c '
+echo "HOME=$HOME"
+ls -la $HOME/.claude/projects/ 2>&1 | head -5
+'
+
+# Docker:
+docker run --rm --entrypoint /bin/bash \
   -v ~/.claude:/home/node/.claude \
   nanoclaw-agent:latest -c '
 echo "HOME=$HOME"
@@ -195,7 +211,7 @@ If an MCP server fails to start, the agent may exit. Check the container logs fo
 
 ## Manual Container Testing
 
-Commands below use `container` (Apple Container). Replace with `docker` if using Docker. Mount syntax differs between runtimes — NanoClaw handles this automatically, but for manual testing:
+Commands below show both Apple Container (`container`) and Docker (`docker`) variants. Mount syntax differs between runtimes -- NanoClaw handles this automatically, but for manual testing:
 - Apple Container readonly: `--mount "type=bind,source=...,target=...,readonly"`
 - Docker readonly: `-v ...:...:ro`
 
@@ -208,8 +224,8 @@ mkdir -p data/env groups/test
 echo '{"prompt":"What is 2+2?","groupFolder":"test","chatJid":"test@g.us","isMain":false}' | \
   container run -i \
   --mount "type=bind,source=$(pwd)/data/env,target=/workspace/env-dir,readonly" \
-  -v $(pwd)/groups/test:/workspace/group \
-  -v $(pwd)/data/ipc:/workspace/ipc \
+  --mount "type=bind,source=$(pwd)/groups/test,target=/workspace/group" \
+  --mount "type=bind,source=$(pwd)/data/ipc,target=/workspace/ipc" \
   nanoclaw-agent:latest
 
 # Docker:
@@ -242,8 +258,9 @@ docker run --rm --entrypoint /bin/bash \
 
 ### Interactive shell in container:
 ```bash
+# Apple Container:
 container run --rm -it --entrypoint /bin/bash nanoclaw-agent:latest
-# or:
+# Docker:
 docker run --rm -it --entrypoint /bin/bash nanoclaw-agent:latest
 ```
 
@@ -292,7 +309,7 @@ docker builder prune -af
 container images
 # or: docker images
 
-# Check what's in the image:
+# Check what's in the image (use "container" for Apple Container, "docker" for Docker):
 container run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c '
   echo "=== Node version ==="
   node --version
