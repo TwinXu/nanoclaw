@@ -62,7 +62,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
   };
 });
 
-import { FeishuChannel, FeishuChannelOpts, FeishuMessageEvent } from './feishu.js';
+import { FeishuChannel, FeishuChannelOpts, FeishuMessageEvent, markdownToPost } from './feishu.js';
 
 // --- Helpers ---
 
@@ -563,10 +563,105 @@ describe('FeishuChannel', () => {
     });
   });
 
+  // --- markdownToPost ---
+
+  describe('markdownToPost', () => {
+    it('converts plain text to single paragraph', () => {
+      expect(markdownToPost('Hello world')).toEqual([
+        [{ tag: 'text', text: 'Hello world' }],
+      ]);
+    });
+
+    it('converts **bold** to bold style', () => {
+      expect(markdownToPost('a **bold** word')).toEqual([
+        [
+          { tag: 'text', text: 'a ' },
+          { tag: 'text', text: 'bold', style: ['bold'] },
+          { tag: 'text', text: ' word' },
+        ],
+      ]);
+    });
+
+    it('converts *italic* to italic style', () => {
+      expect(markdownToPost('an *italic* word')).toEqual([
+        [
+          { tag: 'text', text: 'an ' },
+          { tag: 'text', text: 'italic', style: ['italic'] },
+          { tag: 'text', text: ' word' },
+        ],
+      ]);
+    });
+
+    it('converts ***bold italic***', () => {
+      const result = markdownToPost('***both***');
+      expect(result[0][0]).toEqual({ tag: 'text', text: 'both', style: ['bold', 'italic'] });
+    });
+
+    it('converts [text](url) to link', () => {
+      expect(markdownToPost('click [here](https://example.com) now')).toEqual([
+        [
+          { tag: 'text', text: 'click ' },
+          { tag: 'a', text: 'here', href: 'https://example.com' },
+          { tag: 'text', text: ' now' },
+        ],
+      ]);
+    });
+
+    it('converts ~~strikethrough~~', () => {
+      expect(markdownToPost('~~removed~~')).toEqual([
+        [{ tag: 'text', text: 'removed', style: ['lineThrough'] }],
+      ]);
+    });
+
+    it('strips heading markers and makes bold', () => {
+      expect(markdownToPost('## Heading')).toEqual([
+        [{ tag: 'text', text: 'Heading', style: ['bold'] }],
+      ]);
+    });
+
+    it('preserves list bullet prefix', () => {
+      expect(markdownToPost('- item one')).toEqual([
+        [
+          { tag: 'text', text: '- ' },
+          { tag: 'text', text: 'item one' },
+        ],
+      ]);
+    });
+
+    it('handles code blocks as plain text', () => {
+      const md = '```\nconst x = 1;\n```';
+      expect(markdownToPost(md)).toEqual([
+        [{ tag: 'text', text: 'const x = 1;' }],
+      ]);
+    });
+
+    it('handles inline `code` as plain text', () => {
+      expect(markdownToPost('use `foo()` here')).toEqual([
+        [
+          { tag: 'text', text: 'use ' },
+          { tag: 'text', text: 'foo()' },
+          { tag: 'text', text: ' here' },
+        ],
+      ]);
+    });
+
+    it('handles multiple paragraphs', () => {
+      const result = markdownToPost('line 1\nline 2');
+      expect(result).toHaveLength(2);
+    });
+
+    it('skips empty lines', () => {
+      const result = markdownToPost('first\n\nsecond');
+      expect(result).toHaveLength(2);
+      expect(result[0][0].text).toBe('first');
+      expect(result[1][0].text).toBe('second');
+    });
+  });
+
   // --- sendMessage ---
 
   describe('sendMessage', () => {
-    it('sends text message via API', async () => {
+    it('sends post message via API', async () => {
       const opts = createTestOpts();
       const channel = new FeishuChannel(opts);
       await channel.connect();
@@ -577,8 +672,10 @@ describe('FeishuChannel', () => {
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: 'oc_abc123',
-          content: JSON.stringify({ text: 'Hello!' }),
-          msg_type: 'text',
+          content: JSON.stringify({
+            zh_cn: { content: [[{ tag: 'text', text: 'Hello!' }]] },
+          }),
+          msg_type: 'post',
         },
       });
     });

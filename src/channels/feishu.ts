@@ -30,6 +30,123 @@ interface CachedName {
   ts: number;
 }
 
+// --- Markdown → Feishu Post conversion ---
+
+interface PostElement {
+  tag: string;
+  text?: string;
+  href?: string;
+  style?: string[];
+}
+
+/**
+ * Convert markdown text to Feishu "post" rich-text content paragraphs.
+ * Each inner array is one line/paragraph of PostElements.
+ */
+export function markdownToPost(text: string): PostElement[][] {
+  const paragraphs: PostElement[][] = [];
+  const lines = text.split('\n');
+  let inCodeBlock = false;
+  let codeLines: string[] = [];
+
+  for (const line of lines) {
+    if (line.trimStart().startsWith('```')) {
+      if (inCodeBlock) {
+        paragraphs.push([{ tag: 'text', text: codeLines.join('\n') }]);
+        codeLines = [];
+        inCodeBlock = false;
+      } else {
+        inCodeBlock = true;
+      }
+      continue;
+    }
+    if (inCodeBlock) {
+      codeLines.push(line);
+      continue;
+    }
+    if (line.trim() === '') continue;
+
+    // Heading: strip # prefix, render bold
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      paragraphs.push(parseInlineElements(headingMatch[2], ['bold']));
+      continue;
+    }
+
+    // List item: keep the bullet/number prefix as plain text, parse rest
+    const listMatch = line.match(/^(\s*-\s+|\s*\d+\.\s+)(.*)$/);
+    if (listMatch) {
+      paragraphs.push([
+        { tag: 'text', text: listMatch[1] },
+        ...parseInlineElements(listMatch[2]),
+      ]);
+      continue;
+    }
+
+    paragraphs.push(parseInlineElements(line));
+  }
+
+  // Unclosed code block
+  if (codeLines.length > 0) {
+    paragraphs.push([{ tag: 'text', text: codeLines.join('\n') }]);
+  }
+
+  return paragraphs;
+}
+
+/** Parse inline markdown (bold, italic, links, strikethrough, inline code) into PostElements. */
+function parseInlineElements(text: string, baseStyle?: string[]): PostElement[] {
+  const elements: PostElement[] = [];
+  // Order: bold-italic (***) > bold (**) > italic (*) > strikethrough (~~) > link > inline code
+  const pattern = /(\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|\*(.+?)\*|~~(.+?)~~|\[([^\]]+)\]\(([^)]+)\)|`([^`]+)`)/g;
+  let lastIndex = 0;
+  let match;
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      const plain = text.slice(lastIndex, match.index);
+      if (plain) {
+        const el: PostElement = { tag: 'text', text: plain };
+        if (baseStyle) el.style = [...baseStyle];
+        elements.push(el);
+      }
+    }
+
+    if (match[2]) { // ***bold italic***
+      elements.push({ tag: 'text', text: match[2], style: [...(baseStyle || []), 'bold', 'italic'] });
+    } else if (match[3]) { // **bold**
+      elements.push({ tag: 'text', text: match[3], style: [...(baseStyle || []), 'bold'] });
+    } else if (match[4]) { // *italic*
+      elements.push({ tag: 'text', text: match[4], style: [...(baseStyle || []), 'italic'] });
+    } else if (match[5]) { // ~~strikethrough~~
+      elements.push({ tag: 'text', text: match[5], style: [...(baseStyle || []), 'lineThrough'] });
+    } else if (match[6] && match[7]) { // [text](url)
+      elements.push({ tag: 'a', text: match[6], href: match[7] });
+    } else if (match[8]) { // `code`
+      elements.push({ tag: 'text', text: match[8] });
+    }
+
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (lastIndex < text.length) {
+    const plain = text.slice(lastIndex);
+    if (plain) {
+      const el: PostElement = { tag: 'text', text: plain };
+      if (baseStyle) el.style = [...baseStyle];
+      elements.push(el);
+    }
+  }
+
+  if (elements.length === 0 && text) {
+    const el: PostElement = { tag: 'text', text };
+    if (baseStyle) el.style = [...baseStyle];
+    elements.push(el);
+  }
+
+  return elements;
+}
+
 // --- Feishu message event type ---
 
 export interface FeishuMessageEvent {
@@ -148,12 +265,13 @@ export class FeishuChannel implements Channel {
     const chatId = jid.replace(/@feishu$/, '');
 
     try {
+      const postContent = markdownToPost(text);
       await this.client.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
-          content: JSON.stringify({ text }),
-          msg_type: 'text',
+          content: JSON.stringify({ zh_cn: { content: postContent } }),
+          msg_type: 'post',
         },
       });
       logger.info({ jid, length: text.length }, 'Feishu message sent');
@@ -250,16 +368,9 @@ export class FeishuChannel implements Channel {
 
       logger.info({ jid, imageKey }, 'Feishu image sent');
 
-      // Send caption as a follow-up text message if provided
+      // Send caption as a follow-up rich-text message if provided
       if (caption) {
-        await this.client.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            content: JSON.stringify({ text: caption }),
-            msg_type: 'text',
-          },
-        });
+        await this.sendMessage(jid, caption);
       }
     } catch (err) {
       logger.error({ jid, filePath, err }, 'Failed to send Feishu image');
