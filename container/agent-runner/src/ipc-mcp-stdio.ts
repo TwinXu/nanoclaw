@@ -326,6 +326,83 @@ server.tool(
 );
 
 server.tool(
+  'download_file',
+  `Download a file attachment from a user's message. When you see a message like "[文件 file_key=xxx file_name=report.pdf message_id=yyy]", use this tool with the file_key and message_id values. The file will be downloaded to /workspace/ipc/media/ and the path will be returned.`,
+  {
+    message_id: z.string().describe('The message_id from the file reference'),
+    file_key: z.string().describe('The file_key from the file reference'),
+  },
+  async (args) => {
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    const requestData = {
+      type: 'media_request',
+      requestId,
+      messageId: args.message_id,
+      fileKey: args.file_key,
+      mediaType: 'file',
+      chatJid,
+    };
+
+    fs.mkdirSync(MEDIA_REQUESTS_DIR, { recursive: true });
+    const requestFile = path.join(MEDIA_REQUESTS_DIR, `${requestId}.json`);
+    const tempFile = `${requestFile}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(requestData, null, 2));
+    fs.renameSync(tempFile, requestFile);
+
+    // Poll for the downloaded file (host writes to media/{requestId}.*)
+    const POLL_INTERVAL_MS = 300;
+    const POLL_TIMEOUT_MS = 30000;
+    const start = Date.now();
+
+    while (Date.now() - start < POLL_TIMEOUT_MS) {
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+
+      try {
+        const files = fs.readdirSync(MEDIA_DIR);
+
+        const errorFile = files.find((f) => f === `${requestId}.error`);
+        if (errorFile) {
+          let errorMsg = 'Download failed';
+          try {
+            const errData = JSON.parse(fs.readFileSync(path.join(MEDIA_DIR, errorFile), 'utf-8'));
+            errorMsg = errData.error || errorMsg;
+          } catch { /* use default */ }
+          return {
+            content: [{
+              type: 'text' as const,
+              text: `File download failed: ${errorMsg}. The message may have expired or the file may not be accessible.`,
+            }],
+            isError: true,
+          };
+        }
+
+        const match = files.find((f) => f.startsWith(requestId) && !f.endsWith('.error'));
+        if (match) {
+          const filePath = path.join(MEDIA_DIR, match);
+          return {
+            content: [{
+              type: 'text' as const,
+              text: `File downloaded to ${filePath}`,
+            }],
+          };
+        }
+      } catch {
+        // media dir may not exist yet
+      }
+    }
+
+    return {
+      content: [{
+        type: 'text' as const,
+        text: 'Timed out waiting for file download. The file may not be available.',
+      }],
+      isError: true,
+    };
+  },
+);
+
+server.tool(
   'send_image',
   `Send an image file to the current chat. The file must exist on the filesystem (e.g., a file you created or downloaded). Files are sent via the host, so they must be under /workspace/ipc/ to be accessible.`,
   {
