@@ -126,6 +126,7 @@ downloadMediaImpl = async (chatJid, messageId, fileKey, destDir, requestId) => {
 
 deps = {
   sendMessage: vi.fn(),
+  sendFile: vi.fn(),
   sendImage: vi.fn(async (jid, filePath, caption) => {
     sendImageCalls.push({ jid, filePath, caption });
   }),

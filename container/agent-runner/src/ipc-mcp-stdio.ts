@@ -443,6 +443,48 @@ server.tool(
 );
 
 server.tool(
+  'send_file',
+  `Send a file to the current chat. The file must exist on the filesystem (e.g., a file you created or downloaded). Files are sent via the host, so they must be under /workspace/ipc/ to be accessible.`,
+  {
+    file_path: z.string().describe('Absolute path to the file to send'),
+    file_name: z.string().optional().describe('Display name for the file (defaults to the original filename)'),
+  },
+  async (args) => {
+    if (!fs.existsSync(args.file_path)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${args.file_path}` }],
+        isError: true,
+      };
+    }
+
+    // If file is not under /workspace/ipc/, copy it to media/ so host can access it
+    let filePath = args.file_path;
+    if (!filePath.startsWith('/workspace/ipc/')) {
+      fs.mkdirSync(MEDIA_DIR, { recursive: true });
+      const basename = path.basename(filePath);
+      const destPath = path.join(MEDIA_DIR, `send-${Date.now()}-${basename}`);
+      fs.copyFileSync(filePath, destPath);
+      filePath = destPath;
+    }
+
+    const fileName = args.file_name || path.basename(args.file_path);
+
+    const data: Record<string, string | undefined> = {
+      type: 'file_message',
+      chatJid,
+      filePath,
+      fileName,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: 'File sent.' }] };
+  },
+);
+
+server.tool(
   'register_group',
   `Register a new WhatsApp group so the agent can respond to messages there. Main group only.
 

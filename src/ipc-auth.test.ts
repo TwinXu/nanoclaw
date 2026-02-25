@@ -54,6 +54,7 @@ beforeEach(() => {
   deps = {
     sendMessage: async () => {},
     sendImage: async () => {},
+    sendFile: async () => {},
     downloadMedia: async () => null,
     registeredGroups: () => groups,
     registerGroup: (jid, group) => {

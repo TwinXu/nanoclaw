@@ -510,6 +510,10 @@ async function main(): Promise<void> {
       const ch = findChannel(channels, jid);
       if (ch?.sendImage) await ch.sendImage(jid, filePath, caption);
     },
+    sendFile: async (jid, filePath, fileName) => {
+      const ch = findChannel(channels, jid);
+      if (ch?.sendFile) await ch.sendFile(jid, filePath, fileName);
+    },
     downloadMedia: async (chatJid, messageId, fileKey, destDir, requestId, mediaType?) => {
       const ch = findChannel(channels, chatJid);
       if (ch?.downloadMedia) return ch.downloadMedia(messageId, fileKey, destDir, requestId, mediaType);

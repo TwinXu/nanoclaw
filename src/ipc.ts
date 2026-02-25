@@ -18,6 +18,7 @@ import { RegisteredGroup } from './types.js';
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
   sendImage: (jid: string, filePath: string, caption?: string) => Promise<void>;
+  sendFile: (jid: string, filePath: string, fileName: string) => Promise<void>;
   downloadMedia: (chatJid: string, messageId: string, fileKey: string, destDir: string, requestId: string, mediaType?: string) => Promise<string | null>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
@@ -124,6 +125,34 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC image message attempt blocked',
+                  );
+                }
+              } else if (data.type === 'file_message' && data.chatJid && data.filePath && data.fileName) {
+                // Agent sending a file — translate container path to host path
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  const groupIpcRoot = path.resolve(path.join(DATA_DIR, 'ipc', sourceGroup));
+                  const relativePath = data.filePath.replace(/^\/workspace\/ipc\//, '');
+                  const hostFilePath = path.resolve(path.join(groupIpcRoot, relativePath));
+                  if (!hostFilePath.startsWith(groupIpcRoot + path.sep) && hostFilePath !== groupIpcRoot) {
+                    logger.warn(
+                      { chatJid: data.chatJid, sourceGroup, filePath: data.filePath },
+                      'IPC file path traversal attempt blocked',
+                    );
+                  } else {
+                    await deps.sendFile(data.chatJid, hostFilePath, data.fileName);
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup, filePath: hostFilePath },
+                      'IPC file message sent',
+                    );
+                  }
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC file message attempt blocked',
                   );
                 }
               }

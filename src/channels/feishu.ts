@@ -403,6 +403,46 @@ export class FeishuChannel implements Channel {
     }
   }
 
+  /** Upload and send a file to a Feishu chat. */
+  async sendFile(
+    jid: string,
+    filePath: string,
+    fileName: string,
+  ): Promise<void> {
+    const chatId = jid.replace(/@feishu$/, '');
+
+    try {
+      // Upload file to get file_key
+      const uploadResp = await this.client.im.file.create({
+        data: {
+          file_type: 'stream',
+          file_name: fileName,
+          file: fs.createReadStream(filePath),
+        },
+      });
+
+      const fileKey = (uploadResp as unknown as { data?: { file_key?: string } })?.data?.file_key;
+      if (!fileKey) {
+        logger.error({ filePath, fileName }, 'Feishu file upload returned no file_key');
+        return;
+      }
+
+      // Send file message
+      await this.client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          content: JSON.stringify({ file_key: fileKey }),
+          msg_type: 'file',
+        },
+      });
+
+      logger.info({ jid, fileKey, fileName }, 'Feishu file sent');
+    } catch (err) {
+      logger.error({ jid, filePath, fileName, err }, 'Failed to send Feishu file');
+    }
+  }
+
   // --- Internal ---
 
   private async handleMessage(event: FeishuMessageEvent): Promise<void> {
