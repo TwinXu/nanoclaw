@@ -93,8 +93,8 @@ export interface Channel {
   prefixAssistantName?: boolean;
   // Optional: send an image file to a chat.
   sendImage?(jid: string, filePath: string, caption?: string): Promise<void>;
-  // Optional: download media (e.g. image) from a message to a local directory.
-  downloadMedia?(messageId: string, fileKey: string, destDir: string, requestId: string): Promise<string | null>;
+  // Optional: download media (image or file) from a message to a local directory.
+  downloadMedia?(messageId: string, fileKey: string, destDir: string, requestId: string, mediaType?: string): Promise<string | null>;
 }
 
 // Callback type that channels use to deliver inbound messages

@@ -293,26 +293,52 @@ export class FeishuChannel implements Channel {
     // WSClient doesn't expose a stop method — connection will be GC'd
   }
 
-  /** Download an image from a Feishu message to a local directory. */
+  /** Download an image or file from a Feishu message to a local directory. */
   async downloadMedia(
     messageId: string,
     fileKey: string,
     destDir: string,
     requestId: string,
+    mediaType?: string,
   ): Promise<string | null> {
     try {
+      const type = mediaType === 'file' ? 'file' : 'image';
       const resp = await this.client.im.messageResource.get({
         path: { message_id: messageId, file_key: fileKey },
-        params: { type: 'image' },
+        params: { type },
       });
 
       // SDK returns { writeFile, getReadableStream, headers }
       const contentType = String(resp.headers?.['content-type'] || '');
-      let ext = '.png';
-      if (contentType.includes('jpeg') || contentType.includes('jpg'))
-        ext = '.jpg';
-      else if (contentType.includes('gif')) ext = '.gif';
-      else if (contentType.includes('webp')) ext = '.webp';
+      let ext: string;
+      if (type === 'file') {
+        // Try content-disposition for original filename extension
+        const disposition = String(resp.headers?.['content-disposition'] || '');
+        const filenameMatch = disposition.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i);
+        if (filenameMatch) {
+          const origName = decodeURIComponent(filenameMatch[1].replace(/"/g, ''));
+          const dotIdx = origName.lastIndexOf('.');
+          ext = dotIdx >= 0 ? origName.slice(dotIdx) : '';
+        } else if (contentType.includes('pdf')) {
+          ext = '.pdf';
+        } else if (contentType.includes('zip')) {
+          ext = '.zip';
+        } else if (contentType.includes('word') || contentType.includes('docx')) {
+          ext = '.docx';
+        } else if (contentType.includes('excel') || contentType.includes('spreadsheet') || contentType.includes('xlsx')) {
+          ext = '.xlsx';
+        } else if (contentType.includes('powerpoint') || contentType.includes('presentation') || contentType.includes('pptx')) {
+          ext = '.pptx';
+        } else {
+          ext = '.bin';
+        }
+      } else {
+        ext = '.png';
+        if (contentType.includes('jpeg') || contentType.includes('jpg'))
+          ext = '.jpg';
+        else if (contentType.includes('gif')) ext = '.gif';
+        else if (contentType.includes('webp')) ext = '.webp';
+      }
 
       const filename = `${requestId}${ext}`;
       const destPath = path.join(destDir, filename);
@@ -320,7 +346,7 @@ export class FeishuChannel implements Channel {
       await resp.writeFile(destPath);
 
       logger.info(
-        { messageId, fileKey, destPath },
+        { messageId, fileKey, destPath, type },
         'Feishu media downloaded',
       );
       return filename;
@@ -396,7 +422,7 @@ export class FeishuChannel implements Channel {
     const jid = `${msg.chat_id}@feishu`;
     const timestamp = new Date().toISOString();
 
-    // Extract text content — image messages get a metadata reference instead of placeholder
+    // Extract text content — image/file messages get metadata references instead of placeholders
     let rawContent: string;
     if (msg.message_type === 'image') {
       try {
@@ -404,6 +430,13 @@ export class FeishuChannel implements Channel {
         rawContent = `[图片 image_key=${parsed.image_key} message_id=${msg.message_id}]`;
       } catch {
         rawContent = '[image message]';
+      }
+    } else if (msg.message_type === 'file') {
+      try {
+        const parsed = JSON.parse(msg.content);
+        rawContent = `[文件 file_key=${parsed.file_key} file_name=${parsed.file_name || 'unknown'} message_id=${msg.message_id}]`;
+      } catch {
+        rawContent = '[file message]';
       }
     } else {
       rawContent = this.parseMessageContent(msg.content, msg.message_type);

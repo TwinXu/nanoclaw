@@ -510,9 +510,9 @@ async function main(): Promise<void> {
       const ch = findChannel(channels, jid);
       if (ch?.sendImage) await ch.sendImage(jid, filePath, caption);
     },
-    downloadMedia: async (chatJid, messageId, fileKey, destDir, requestId) => {
+    downloadMedia: async (chatJid, messageId, fileKey, destDir, requestId, mediaType?) => {
       const ch = findChannel(channels, chatJid);
-      if (ch?.downloadMedia) return ch.downloadMedia(messageId, fileKey, destDir, requestId);
+      if (ch?.downloadMedia) return ch.downloadMedia(messageId, fileKey, destDir, requestId, mediaType);
       return null;
     },
     registeredGroups: () => registeredGroups,

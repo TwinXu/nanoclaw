@@ -219,9 +219,10 @@ describe('FeishuChannel', () => {
       expect(result).toBe('[image message]');
     });
 
-    it('returns placeholder for file message', () => {
+    it('returns placeholder for file message via parseMessageContent', () => {
       const channel = new FeishuChannel(createTestOpts());
-      const result = channel.parseMessageContent('{"file_key":"f_123"}', 'file');
+      const result = channel.parseMessageContent('{"file_key":"f_123","file_name":"report.pdf"}', 'file');
+      // parseMessageContent still returns placeholder; file metadata is handled in handleMessage
       expect(result).toBe('[file message]');
     });
 
@@ -465,6 +466,68 @@ describe('FeishuChannel', () => {
         'oc_abc123@feishu',
         expect.objectContaining({
           content: '[图片 image_key=img_v3_abc123 message_id=msg_img_1]',
+        }),
+      );
+    });
+
+    it('delivers file message with metadata reference', async () => {
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        chatId: 'oc_abc123',
+        messageType: 'file',
+        content: '{"file_key":"file_v3_abc","file_name":"report.pdf"}',
+        messageId: 'msg_file_1',
+      });
+      await registeredHandler!(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'oc_abc123@feishu',
+        expect.objectContaining({
+          content: '[文件 file_key=file_v3_abc file_name=report.pdf message_id=msg_file_1]',
+        }),
+      );
+    });
+
+    it('handles file message with missing file_name', async () => {
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        chatId: 'oc_abc123',
+        messageType: 'file',
+        content: '{"file_key":"file_v3_abc"}',
+        messageId: 'msg_file_2',
+      });
+      await registeredHandler!(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'oc_abc123@feishu',
+        expect.objectContaining({
+          content: '[文件 file_key=file_v3_abc file_name=unknown message_id=msg_file_2]',
+        }),
+      );
+    });
+
+    it('falls back to placeholder for file with malformed JSON', async () => {
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        chatId: 'oc_abc123',
+        messageType: 'file',
+        content: 'not-json',
+      });
+      await registeredHandler!(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'oc_abc123@feishu',
+        expect.objectContaining({
+          content: '[file message]',
         }),
       );
     });

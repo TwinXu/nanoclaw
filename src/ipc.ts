@@ -18,7 +18,7 @@ import { RegisteredGroup } from './types.js';
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
   sendImage: (jid: string, filePath: string, caption?: string) => Promise<void>;
-  downloadMedia: (chatJid: string, messageId: string, fileKey: string, destDir: string, requestId: string) => Promise<string | null>;
+  downloadMedia: (chatJid: string, messageId: string, fileKey: string, destDir: string, requestId: string, mediaType?: string) => Promise<string | null>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
@@ -159,7 +159,9 @@ export function startIpcWatcher(deps: IpcDeps): void {
             const filePath = path.join(mediaRequestsDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'media_request' && data.requestId && data.messageId && data.imageKey) {
+              // Accept both imageKey (legacy) and fileKey for the resource key
+              const resourceKey = data.imageKey || data.fileKey;
+              if (data.type === 'media_request' && data.requestId && data.messageId && resourceKey) {
                 if (!data.chatJid) {
                   logger.warn({ sourceGroup, requestId: data.requestId }, 'Media request missing chatJid');
                   // Write error so agent doesn't hang waiting
@@ -172,9 +174,10 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   const result = await deps.downloadMedia(
                     data.chatJid,
                     data.messageId,
-                    data.imageKey,
+                    resourceKey,
                     destDir,
                     data.requestId,
+                    data.mediaType,
                   );
                   if (!result) {
                     // Write error file so the agent's polling loop can detect it
