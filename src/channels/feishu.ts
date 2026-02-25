@@ -376,7 +376,7 @@ export class FeishuChannel implements Channel {
         },
       });
 
-      const imageKey = (uploadResp as unknown as { data?: { image_key?: string } })?.data?.image_key;
+      const imageKey = (uploadResp as { image_key?: string } | null)?.image_key;
       if (!imageKey) {
         logger.error({ filePath }, 'Feishu image upload returned no image_key');
         return;
@@ -421,7 +421,7 @@ export class FeishuChannel implements Channel {
         },
       });
 
-      const fileKey = (uploadResp as unknown as { data?: { file_key?: string } })?.data?.file_key;
+      const fileKey = (uploadResp as { file_key?: string } | null)?.file_key;
       if (!fileKey) {
         logger.error({ filePath, fileName }, 'Feishu file upload returned no file_key');
         return;
