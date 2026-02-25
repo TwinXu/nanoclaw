@@ -39,7 +39,9 @@ Returns page titles, tokens, types, and whether they have children. Use `-p` to 
 feishu-wiki read <url_or_token>
 ```
 
-Reads a docx document and outputs its content as plain text. Accepts either a full Feishu URL or a wiki node token.
+Reads a document and outputs its content as plain text. Supports docx documents and spreadsheets (sheets). Accepts either a full Feishu URL or a wiki node token.
+
+For spreadsheets, outputs tab-separated values for each sheet (up to 1000 rows per sheet). Multi-sheet spreadsheets show each sheet with a `--- Sheet: name ---` header.
 
 URL formats accepted:
 - `https://org.feishu.cn/wiki/ABC123`

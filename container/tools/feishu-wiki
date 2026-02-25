@@ -167,9 +167,14 @@ async function readDocument(token) {
   const docToken = node.obj_token;
   const docType = node.obj_type;
 
+  if (docType === 'sheet') {
+    await readSheet(docToken);
+    return;
+  }
+
   if (docType !== 'docx' && docType !== 'doc') {
     fatal(
-      `Document type "${docType}" is not supported for reading. Only docx documents can be read as text.\n` +
+      `Document type "${docType}" is not supported for reading. Only docx and sheet documents can be read.\n` +
         `  Title: ${node.title}\n  Doc token: ${docToken}`,
     );
   }
@@ -179,6 +184,70 @@ async function readDocument(token) {
     `/open-apis/docx/v1/documents/${docToken}/raw_content`,
   );
   console.log(content.content);
+}
+
+const MAX_SHEET_ROWS = 1000;
+
+function colToLetter(col) {
+  let s = '';
+  while (col > 0) {
+    col--;
+    s = String.fromCharCode(65 + (col % 26)) + s;
+    col = Math.floor(col / 26);
+  }
+  return s;
+}
+
+async function readSheet(docToken) {
+  const meta = await api(
+    `/open-apis/sheets/v2/spreadsheets/${docToken}/metainfo`,
+  );
+  const sheets = meta.sheets || [];
+
+  if (!sheets.length) {
+    console.log('(empty spreadsheet)');
+    return;
+  }
+
+  for (let i = 0; i < sheets.length; i++) {
+    const sheet = sheets[i];
+    const { sheetId, title, rowCount, columnCount } = sheet;
+
+    if (sheets.length > 1) {
+      console.log(`--- Sheet: ${title} ---\n`);
+    }
+
+    if (!rowCount || !columnCount) {
+      console.log('(empty sheet)\n');
+      continue;
+    }
+
+    const readRows = Math.min(rowCount, MAX_SHEET_ROWS);
+    const endCol = colToLetter(columnCount);
+    const range = `${sheetId}!A1:${endCol}${readRows}`;
+
+    const result = await api(
+      `/open-apis/sheets/v2/spreadsheets/${docToken}/values/${range}?valueRenderOption=ToString`,
+    );
+
+    const rows = result.valueRange?.values || [];
+    for (const row of rows) {
+      const cells = Array.isArray(row)
+        ? row.map((c) =>
+            c == null ? '' : String(c).replace(/[\t\r\n]+/g, ' '),
+          )
+        : [];
+      console.log(cells.join('\t'));
+    }
+
+    if (rowCount > MAX_SHEET_ROWS) {
+      console.log(
+        `\n... (${rowCount - MAX_SHEET_ROWS} more rows truncated)`,
+      );
+    }
+
+    if (i < sheets.length - 1) console.log();
+  }
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────
