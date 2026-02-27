@@ -37,6 +37,7 @@ interface PostElement {
   text?: string;
   href?: string;
   style?: string[];
+  user_id?: string; // for "at" tag
 }
 
 /**
@@ -202,6 +203,9 @@ export class FeishuChannel implements Channel {
   private senderNames = new Map<string, CachedName>();
   private chatNames = new Map<string, CachedName>();
 
+  // Chat member cache: chatId -> { members: Map<name, openId>, ts }
+  private chatMemberCache = new Map<string, { members: Map<string, string>; ts: number }>();
+
   constructor(opts: FeishuChannelOpts) {
     this.opts = opts;
   }
@@ -265,7 +269,17 @@ export class FeishuChannel implements Channel {
     const chatId = jid.replace(/@feishu$/, '');
 
     try {
-      const postContent = markdownToPost(text);
+      let postContent = markdownToPost(text);
+
+      // Resolve @Name mentions to Feishu at-elements
+      // Require @ at start or after whitespace to avoid false positives (e.g. emails)
+      if (/(^|\s)@[^\s@]/.test(text)) {
+        const memberMap = await this.getChatMembers(chatId);
+        if (memberMap.size > 0) {
+          postContent = this.resolveMentionsInPost(postContent, memberMap);
+        }
+      }
+
       await this.client.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
@@ -441,6 +455,128 @@ export class FeishuChannel implements Channel {
     } catch (err) {
       logger.error({ jid, filePath, fileName, err }, 'Failed to send Feishu file');
     }
+  }
+
+  // --- Mention resolution ---
+
+  /** Fetch chat members and cache the name→open_id mapping. */
+  private async getChatMembers(chatId: string): Promise<Map<string, string>> {
+    const cached = this.chatMemberCache.get(chatId);
+    if (cached && Date.now() - cached.ts < NAME_CACHE_TTL_MS) {
+      return cached.members;
+    }
+
+    // Validate chatId format (Feishu chat IDs start with oc_)
+    if (!/^oc_\w+$/.test(chatId)) {
+      logger.debug({ chatId }, 'Skipping member fetch for non-group chat');
+      return new Map();
+    }
+
+    try {
+      const members = new Map<string, string>();
+      let pageToken: string | undefined;
+
+      do {
+        const params: Record<string, string | number> = {
+          member_id_type: 'open_id',
+          page_size: 100,
+        };
+        if (pageToken) params.page_token = pageToken;
+
+        const resp = await this.client.request<{
+          data?: {
+            items?: Array<{ member_id?: string; name?: string }>;
+            page_token?: string;
+            has_more?: boolean;
+          };
+        }>({
+          method: 'GET',
+          url: `/open-apis/im/v1/chats/${chatId}/members`,
+          params,
+        });
+
+        for (const item of resp?.data?.items || []) {
+          if (item.name && item.member_id) {
+            if (members.has(item.name)) {
+              logger.warn(
+                { chatId, name: item.name, existingId: members.get(item.name), newId: item.member_id },
+                'Duplicate member name in chat, later entry wins',
+              );
+            }
+            members.set(item.name, item.member_id);
+          }
+        }
+
+        pageToken = resp?.data?.has_more ? resp?.data?.page_token : undefined;
+      } while (pageToken);
+
+      this.chatMemberCache.set(chatId, { members, ts: Date.now() });
+      return members;
+    } catch (err) {
+      logger.debug({ chatId, err }, 'Failed to fetch chat members');
+      return new Map();
+    }
+  }
+
+  /** Replace @Name text fragments in post elements with Feishu at-elements. */
+  private resolveMentionsInPost(
+    paragraphs: PostElement[][],
+    memberMap: Map<string, string>,
+  ): PostElement[][] {
+    return paragraphs.map(paragraph =>
+      paragraph.flatMap(el => {
+        if (el.tag !== 'text' || !el.text || !el.text.includes('@')) return [el];
+        return this.splitTextOnMentions(el.text, memberMap, el.style);
+      }),
+    );
+  }
+
+  /** Split a text string on @Name patterns, replacing matched names with at-elements. */
+  private splitTextOnMentions(
+    text: string,
+    memberMap: Map<string, string>,
+    style?: string[],
+  ): PostElement[] {
+    const elements: PostElement[] = [];
+    const pattern = /@([^\s@,.:;!?，。：；！？]+)/g;
+    let lastIndex = 0;
+    let match;
+
+    while ((match = pattern.exec(text)) !== null) {
+      const name = match[1];
+      const openId = memberMap.get(name);
+
+      if (!openId) continue; // Not a known member, leave as plain text
+
+      // Add text before the mention
+      if (match.index > lastIndex) {
+        const before = text.slice(lastIndex, match.index);
+        const el: PostElement = { tag: 'text', text: before };
+        if (style) el.style = [...style];
+        elements.push(el);
+      }
+
+      // Add at-element
+      elements.push({ tag: 'at', user_id: openId });
+      lastIndex = match.index + match[0].length;
+    }
+
+    // No matches found — return original text element
+    if (lastIndex === 0) {
+      const el: PostElement = { tag: 'text', text };
+      if (style) el.style = [...style];
+      return [el];
+    }
+
+    // Add remaining text after last match
+    if (lastIndex < text.length) {
+      const remaining = text.slice(lastIndex);
+      const el: PostElement = { tag: 'text', text: remaining };
+      if (style) el.style = [...style];
+      elements.push(el);
+    }
+
+    return elements;
   }
 
   // --- Internal ---

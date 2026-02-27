@@ -26,8 +26,12 @@ const mockUserGet = vi.fn().mockResolvedValue({
 const mockChatGet = vi.fn().mockResolvedValue({
   data: { name: 'Test Chat' },
 });
-const mockBotInfoRequest = vi.fn().mockResolvedValue({
-  bot: { open_id: 'ou_bot123' },
+const mockRequest = vi.fn().mockImplementation(async (opts: { url: string }) => {
+  if (opts.url === '/open-apis/bot/v3/info') {
+    return { bot: { open_id: 'ou_bot123' } };
+  }
+  // Default: chat members endpoint returns empty
+  return { data: { items: [], has_more: false } };
 });
 
 const mockClient = {
@@ -38,7 +42,7 @@ const mockClient = {
   contact: {
     user: { get: mockUserGet },
   },
-  request: mockBotInfoRequest,
+  request: mockRequest,
 };
 
 const mockWsStart = vi.fn();
@@ -179,7 +183,9 @@ describe('FeishuChannel', () => {
       await channel.connect();
 
       expect(channel.isConnected()).toBe(true);
-      expect(mockBotInfoRequest).toHaveBeenCalled();
+      expect(mockRequest).toHaveBeenCalledWith(
+        expect.objectContaining({ url: '/open-apis/bot/v3/info' }),
+      );
       expect(mockWsStart).toHaveBeenCalled();
     });
 
@@ -194,7 +200,7 @@ describe('FeishuChannel', () => {
     });
 
     it('handles bot info fetch failure gracefully', async () => {
-      mockBotInfoRequest.mockRejectedValueOnce(new Error('Network error'));
+      mockRequest.mockRejectedValueOnce(new Error('Network error'));
 
       const opts = createTestOpts();
       const channel = new FeishuChannel(opts);
@@ -770,6 +776,257 @@ describe('FeishuChannel', () => {
       await expect(
         channel.sendMessage('oc_abc123@feishu', 'Test'),
       ).resolves.toBeUndefined();
+    });
+
+    it('resolves @Name to Feishu at-element when member found', async () => {
+      mockRequest.mockImplementation(async (opts: { url: string }) => {
+        if (opts.url === '/open-apis/bot/v3/info') {
+          return { bot: { open_id: 'ou_bot123' } };
+        }
+        if (opts.url.includes('/members')) {
+          return {
+            data: {
+              items: [
+                { member_id: 'ou_alice1', name: 'Alice' },
+                { member_id: 'ou_bob2', name: 'Bob' },
+              ],
+              has_more: false,
+            },
+          };
+        }
+        return {};
+      });
+
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage('oc_abc123@feishu', 'Hey @Alice please help');
+
+      const sentContent = JSON.parse(mockCreate.mock.calls[0][0].data.content);
+      const paragraph = sentContent.zh_cn.content[0];
+      expect(paragraph).toEqual([
+        { tag: 'text', text: 'Hey ' },
+        { tag: 'at', user_id: 'ou_alice1' },
+        { tag: 'text', text: ' please help' },
+      ]);
+    });
+
+    it('resolves multiple @mentions in one message', async () => {
+      mockRequest.mockImplementation(async (opts: { url: string }) => {
+        if (opts.url === '/open-apis/bot/v3/info') {
+          return { bot: { open_id: 'ou_bot123' } };
+        }
+        if (opts.url.includes('/members')) {
+          return {
+            data: {
+              items: [
+                { member_id: 'ou_alice1', name: 'Alice' },
+                { member_id: 'ou_bob2', name: 'Bob' },
+              ],
+              has_more: false,
+            },
+          };
+        }
+        return {};
+      });
+
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage('oc_abc123@feishu', '@Alice and @Bob check this');
+
+      const sentContent = JSON.parse(mockCreate.mock.calls[0][0].data.content);
+      const paragraph = sentContent.zh_cn.content[0];
+      expect(paragraph).toEqual([
+        { tag: 'at', user_id: 'ou_alice1' },
+        { tag: 'text', text: ' and ' },
+        { tag: 'at', user_id: 'ou_bob2' },
+        { tag: 'text', text: ' check this' },
+      ]);
+    });
+
+    it('leaves @Name as plain text when member not found', async () => {
+      mockRequest.mockImplementation(async (opts: { url: string }) => {
+        if (opts.url === '/open-apis/bot/v3/info') {
+          return { bot: { open_id: 'ou_bot123' } };
+        }
+        if (opts.url.includes('/members')) {
+          return { data: { items: [], has_more: false } };
+        }
+        return {};
+      });
+
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage('oc_abc123@feishu', 'Hey @Unknown hi');
+
+      const sentContent = JSON.parse(mockCreate.mock.calls[0][0].data.content);
+      const paragraph = sentContent.zh_cn.content[0];
+      expect(paragraph).toEqual([
+        { tag: 'text', text: 'Hey @Unknown hi' },
+      ]);
+    });
+
+    it('resolves known @mention but leaves unknown as text', async () => {
+      mockRequest.mockImplementation(async (opts: { url: string }) => {
+        if (opts.url === '/open-apis/bot/v3/info') {
+          return { bot: { open_id: 'ou_bot123' } };
+        }
+        if (opts.url.includes('/members')) {
+          return {
+            data: {
+              items: [{ member_id: 'ou_alice1', name: 'Alice' }],
+              has_more: false,
+            },
+          };
+        }
+        return {};
+      });
+
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage('oc_abc123@feishu', '@Alice and @Unknown');
+
+      const sentContent = JSON.parse(mockCreate.mock.calls[0][0].data.content);
+      const paragraph = sentContent.zh_cn.content[0];
+      expect(paragraph).toEqual([
+        { tag: 'at', user_id: 'ou_alice1' },
+        { tag: 'text', text: ' and @Unknown' },
+      ]);
+    });
+
+    it('paginates through all chat members', async () => {
+      let callCount = 0;
+      mockRequest.mockImplementation(async (opts: { url: string; params?: Record<string, unknown> }) => {
+        if (opts.url === '/open-apis/bot/v3/info') {
+          return { bot: { open_id: 'ou_bot123' } };
+        }
+        if (opts.url.includes('/members')) {
+          callCount++;
+          if (!opts.params?.page_token) {
+            // First page
+            return {
+              data: {
+                items: [{ member_id: 'ou_alice1', name: 'Alice' }],
+                page_token: 'page2',
+                has_more: true,
+              },
+            };
+          }
+          // Second page
+          return {
+            data: {
+              items: [{ member_id: 'ou_bob2', name: 'Bob' }],
+              has_more: false,
+            },
+          };
+        }
+        return {};
+      });
+
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage('oc_abc123@feishu', '@Alice and @Bob');
+
+      // Should have fetched two pages
+      expect(callCount).toBe(2);
+
+      const sentContent = JSON.parse(mockCreate.mock.calls[0][0].data.content);
+      const paragraph = sentContent.zh_cn.content[0];
+      expect(paragraph).toEqual([
+        { tag: 'at', user_id: 'ou_alice1' },
+        { tag: 'text', text: ' and ' },
+        { tag: 'at', user_id: 'ou_bob2' },
+      ]);
+    });
+
+    it('caches chat members across sendMessage calls', async () => {
+      let memberFetchCount = 0;
+      mockRequest.mockImplementation(async (opts: { url: string }) => {
+        if (opts.url === '/open-apis/bot/v3/info') {
+          return { bot: { open_id: 'ou_bot123' } };
+        }
+        if (opts.url.includes('/members')) {
+          memberFetchCount++;
+          return {
+            data: {
+              items: [{ member_id: 'ou_alice1', name: 'Alice' }],
+              has_more: false,
+            },
+          };
+        }
+        return {};
+      });
+
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      await channel.sendMessage('oc_abc123@feishu', 'Hey @Alice');
+      await channel.sendMessage('oc_abc123@feishu', 'Again @Alice');
+
+      // Members API should only be called once (cached on second call)
+      expect(memberFetchCount).toBe(1);
+    });
+
+    it('does not fetch members for non-group chats (DMs)', async () => {
+      let memberFetchCount = 0;
+      mockRequest.mockImplementation(async (opts: { url: string }) => {
+        if (opts.url === '/open-apis/bot/v3/info') {
+          return { bot: { open_id: 'ou_bot123' } };
+        }
+        if (opts.url.includes('/members')) {
+          memberFetchCount++;
+          return { data: { items: [], has_more: false } };
+        }
+        return {};
+      });
+
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      // DM chat IDs start with ou_, not oc_
+      await channel.sendMessage('ou_dm_user@feishu', 'Hey @Alice');
+
+      expect(memberFetchCount).toBe(0);
+    });
+
+    it('does not fetch members for email-like @ patterns', async () => {
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      mockRequest.mockClear();
+      await channel.sendMessage('oc_abc123@feishu', 'Contact user@example.com');
+
+      const memberCalls = mockRequest.mock.calls.filter(
+        (call) => String(call[0]?.url || '').includes('/members'),
+      );
+      expect(memberCalls).toHaveLength(0);
+    });
+
+    it('skips member lookup when text has no @', async () => {
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      mockRequest.mockClear();
+      await channel.sendMessage('oc_abc123@feishu', 'No mentions here');
+
+      // Should not call request for members (only bot info was called during connect)
+      const memberCalls = mockRequest.mock.calls.filter(
+        (call) => String(call[0]?.url || '').includes('/members'),
+      );
+      expect(memberCalls).toHaveLength(0);
     });
   });
 });
