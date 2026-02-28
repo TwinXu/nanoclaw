@@ -538,6 +538,58 @@ describe('FeishuChannel', () => {
       );
     });
 
+    it('sets is_bot_mentioned when bot is @mentioned', async () => {
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        chatId: 'oc_abc123',
+        content: '{"text":"@_user_1 help me"}',
+        mentions: [
+          {
+            key: '@_user_1',
+            id: { open_id: 'ou_bot123' },
+            name: 'Andy',
+          },
+        ],
+      });
+      await registeredHandler!(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'oc_abc123@feishu',
+        expect.objectContaining({
+          is_bot_mentioned: true,
+        }),
+      );
+    });
+
+    it('does not set is_bot_mentioned for non-bot mentions', async () => {
+      const opts = createTestOpts();
+      const channel = new FeishuChannel(opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        chatId: 'oc_abc123',
+        content: '{"text":"@_user_1 hello"}',
+        mentions: [
+          {
+            key: '@_user_1',
+            id: { open_id: 'ou_someone_else' },
+            name: 'Alice',
+          },
+        ],
+      });
+      await registeredHandler!(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'oc_abc123@feishu',
+        expect.objectContaining({
+          is_bot_mentioned: undefined,
+        }),
+      );
+    });
+
     it('falls back to placeholder for image with malformed JSON', async () => {
       const opts = createTestOpts();
       const channel = new FeishuChannel(opts);

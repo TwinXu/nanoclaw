@@ -630,6 +630,11 @@ export class FeishuChannel implements Channel {
     // Always notify about metadata
     this.opts.onChatMetadata(jid, timestamp, chatName || undefined);
 
+    // Check if the bot was @mentioned in this message
+    const isBotMentioned = this.botOpenId
+      ? (msg.mentions ?? []).some((m) => m.id.open_id === this.botOpenId)
+      : false;
+
     // Only deliver full message for registered groups
     const groups = this.opts.registeredGroups();
     if (groups[jid]) {
@@ -641,6 +646,7 @@ export class FeishuChannel implements Channel {
         content,
         timestamp,
         is_from_me: false, // Bot's own messages are filtered above
+        is_bot_mentioned: isBotMentioned || undefined,
       });
     }
   }
