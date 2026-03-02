@@ -81,13 +81,11 @@ export function buildMountArg(mount: VolumeMount): string[] {
   const runtime = getRuntime();
 
   if (runtime === 'apple-container') {
-    if (mount.readonly) {
-      return [
-        '--mount',
-        `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
-      ];
-    }
-    return ['-v', `${mount.hostPath}:${mount.containerPath}`];
+    // Always use --mount for Apple Container to preserve mount ordering.
+    // Mixing --mount (ro) and -v (rw) can cause the runtime to reorder
+    // them, breaking sub-path overlays (e.g. rw child under ro parent).
+    const arg = `type=bind,source=${mount.hostPath},target=${mount.containerPath}${mount.readonly ? ',readonly' : ''}`;
+    return ['--mount', arg];
   }
 
   // Docker: -v with optional :ro suffix
