@@ -392,9 +392,13 @@ async function runQuery(
   let resultCount = 0;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+  // Main: global is at /workspace/project/groups/global (writable overlay)
+  // Non-main: global is at /workspace/global (read-only)
+  const globalClaudeMdPath = containerInput.isMain
+    ? '/workspace/project/groups/global/CLAUDE.md'
+    : '/workspace/global/CLAUDE.md';
   let globalClaudeMd: string | undefined;
-  if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
+  if (fs.existsSync(globalClaudeMdPath)) {
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
@@ -531,7 +535,10 @@ async function main(): Promise<void> {
 
   // Replace {{ASSISTANT_NAME}} placeholders in CLAUDE.md files
   const assistantName = process.env.ASSISTANT_NAME || 'Andy';
-  for (const mdPath of ['/workspace/group/CLAUDE.md', '/workspace/global/CLAUDE.md']) {
+  const globalMdPath = containerInput.isMain
+    ? '/workspace/project/groups/global/CLAUDE.md'
+    : '/workspace/global/CLAUDE.md';
+  for (const mdPath of ['/workspace/group/CLAUDE.md', globalMdPath]) {
     if (fs.existsSync(mdPath)) {
       const content = fs.readFileSync(mdPath, 'utf-8');
       if (content.includes('{{ASSISTANT_NAME}}')) {

@@ -74,7 +74,7 @@ export function getRuntimeBinary(): string {
 /**
  * Build CLI args for a single volume mount.
  *
- * Apple Container: readonly uses --mount, read-write uses -v
+ * Apple Container: always uses --mount (preserves ordering for sub-path overlays)
  * Docker: always uses -v with optional :ro suffix
  */
 export function buildMountArg(mount: VolumeMount): string[] {
