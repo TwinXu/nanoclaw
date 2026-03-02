@@ -75,6 +75,13 @@ function buildVolumeMounts(
       containerPath: '/workspace/group',
       readonly: false,
     });
+
+    // Main gets writable global memory at its natural project path
+    mounts.push({
+      hostPath: path.join(GROUPS_DIR, 'global'),
+      containerPath: '/workspace/project/groups/global',
+      readonly: false,
+    });
   } else {
     // Other groups only get their own folder
     mounts.push({
@@ -83,16 +90,12 @@ function buildVolumeMounts(
       readonly: false,
     });
 
-    // Global memory directory (read-only for non-main)
-    // Only directory mounts are supported, not file mounts
-    const globalDir = path.join(GROUPS_DIR, 'global');
-    if (fs.existsSync(globalDir)) {
-      mounts.push({
-        hostPath: globalDir,
-        containerPath: '/workspace/global',
-        readonly: true,
-      });
-    }
+    // Non-main gets read-only global memory
+    mounts.push({
+      hostPath: path.join(GROUPS_DIR, 'global'),
+      containerPath: '/workspace/global',
+      readonly: true,
+    });
   }
 
   // Per-group Claude sessions directory (isolated from other groups)
@@ -233,6 +236,7 @@ export async function runContainerAgent(
 
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
+  fs.mkdirSync(path.join(GROUPS_DIR, 'global'), { recursive: true });
 
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
