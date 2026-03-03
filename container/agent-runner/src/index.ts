@@ -19,8 +19,14 @@ import path from 'path';
 import { query, HookCallback, PreCompactHookInput, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
+interface MediaAttachment {
+  data: string;       // base64-encoded image data
+  mediaType: string;  // "image/jpeg" | "image/png" | "image/webp" | "image/gif"
+}
+
 interface ContainerInput {
   prompt: string;
+  media?: MediaAttachment[];
   sessionId?: string;
   groupFolder: string;
   chatJid: string;
@@ -48,9 +54,13 @@ interface SessionsIndex {
   entries: SessionEntry[];
 }
 
+type ContentBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+
 interface SDKUserMessage {
   type: 'user';
-  message: { role: 'user'; content: string };
+  message: { role: 'user'; content: string | ContentBlock[] };
   parent_tool_use_id: null;
   session_id: string;
 }
@@ -68,10 +78,10 @@ class MessageStream {
   private waiting: (() => void) | null = null;
   private done = false;
 
-  push(text: string): void {
+  push(content: string | ContentBlock[]): void {
     this.queue.push({
       type: 'user',
-      message: { role: 'user', content: text },
+      message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: '',
     });
@@ -294,25 +304,44 @@ function shouldClose(): boolean {
   return false;
 }
 
+interface IpcMessage {
+  text: string;
+  media?: MediaAttachment[];
+}
+
+/** Build a text string or multimodal content block array from an IPC message. */
+function buildContent(msg: IpcMessage): string | ContentBlock[] {
+  if (!msg.media?.length) return msg.text;
+  const blocks: ContentBlock[] = [];
+  for (const m of msg.media) {
+    blocks.push({
+      type: 'image',
+      source: { type: 'base64', media_type: m.mediaType, data: m.data },
+    });
+  }
+  blocks.push({ type: 'text', text: msg.text });
+  return blocks;
+}
+
 /**
  * Drain all pending IPC input messages.
- * Returns messages found, or empty array.
+ * Returns structured messages with optional media attachments.
  */
-function drainIpcInput(): string[] {
+function drainIpcInput(): IpcMessage[] {
   try {
     fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
     const files = fs.readdirSync(IPC_INPUT_DIR)
       .filter(f => f.endsWith('.json'))
       .sort();
 
-    const messages: string[] = [];
+    const messages: IpcMessage[] = [];
     for (const file of files) {
       const filePath = path.join(IPC_INPUT_DIR, file);
       try {
         const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
         fs.unlinkSync(filePath);
         if (data.type === 'message' && data.text) {
-          messages.push(data.text);
+          messages.push({ text: data.text, media: data.media });
         }
       } catch (err) {
         log(`Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`);
@@ -328,9 +357,9 @@ function drainIpcInput(): string[] {
 
 /**
  * Wait for a new IPC message or _close sentinel.
- * Returns the messages as a single string, or null if _close.
+ * Returns content (string or multimodal blocks), or null if _close.
  */
-function waitForIpcMessage(): Promise<string | null> {
+function waitForIpcMessage(): Promise<string | ContentBlock[] | null> {
   return new Promise((resolve) => {
     const poll = () => {
       if (shouldClose()) {
@@ -339,7 +368,14 @@ function waitForIpcMessage(): Promise<string | null> {
       }
       const messages = drainIpcInput();
       if (messages.length > 0) {
-        resolve(messages.join('\n'));
+        if (messages.length === 1) {
+          resolve(buildContent(messages[0]));
+        } else {
+          // Multiple messages: merge text; if any have media, build multimodal
+          const allMedia = messages.flatMap((m) => m.media || []);
+          const combinedText = messages.map((m) => m.text).join('\n');
+          resolve(buildContent({ text: combinedText, media: allMedia.length > 0 ? allMedia : undefined }));
+        }
         return;
       }
       setTimeout(poll, IPC_POLL_MS);
@@ -355,7 +391,7 @@ function waitForIpcMessage(): Promise<string | null> {
  * Also pipes IPC messages into the stream during the query.
  */
 async function runQuery(
-  prompt: string,
+  prompt: string | ContentBlock[],
   sessionId: string | undefined,
   mcpServerPath: string,
   containerInput: ContainerInput,
@@ -378,9 +414,11 @@ async function runQuery(
       return;
     }
     const messages = drainIpcInput();
-    for (const text of messages) {
-      log(`Piping IPC message into active query (${text.length} chars)`);
-      stream.push(text);
+    for (const msg of messages) {
+      const content = buildContent(msg);
+      const desc = typeof content === 'string' ? `${content.length} chars` : `multimodal (${msg.media?.length} images)`;
+      log(`Piping IPC message into active query (${desc})`);
+      stream.push(content);
     }
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
   };
@@ -558,14 +596,24 @@ async function main(): Promise<void> {
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
 
   // Build initial prompt (drain any pending IPC messages too)
-  let prompt = containerInput.prompt;
+  let promptText = containerInput.prompt;
   if (containerInput.isScheduledTask) {
-    prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
+    promptText = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${promptText}`;
   }
   const pending = drainIpcInput();
+  let pendingMedia: MediaAttachment[] = [];
   if (pending.length > 0) {
     log(`Draining ${pending.length} pending IPC messages into initial prompt`);
-    prompt += '\n' + pending.join('\n');
+    promptText += '\n' + pending.map((m) => m.text).join('\n');
+    pendingMedia = pending.flatMap((m) => m.media || []);
+  }
+
+  // Build multimodal content blocks if media attachments are present
+  const allMedia = [...(containerInput.media || []), ...pendingMedia];
+  let prompt: string | ContentBlock[] = promptText;
+  if (allMedia.length > 0) {
+    prompt = buildContent({ text: promptText, media: allMedia });
+    log(`Built multimodal prompt with ${allMedia.length} image(s)`);
   }
 
   // Query loop: run query → wait for IPC message → run new query → repeat

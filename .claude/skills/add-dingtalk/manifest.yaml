@@ -9,6 +9,8 @@ modifies:
   - src/index.ts
   - src/config.ts
   - src/container-runner.ts
+  - src/router.ts
+  - src/group-queue.ts
 structured:
   npm_dependencies:
     dingtalk-stream: "^2.1.4"

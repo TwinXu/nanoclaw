@@ -1,9 +1,12 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
   ASSISTANT_NAME,
   DATA_DIR,
+  DINGTALK_APP_KEY,
+  DINGTALK_APP_SECRET,
   FEISHU_APP_ID,
   FEISHU_APP_SECRET,
   IDLE_TIMEOUT,
@@ -12,10 +15,12 @@ import {
   TRIGGER_PATTERN,
   WHATSAPP_DISABLED,
 } from './config.js';
+import { DingTalkChannel } from './channels/dingtalk.js';
 import { FeishuChannel } from './channels/feishu.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import {
   ContainerOutput,
+  MediaAttachment,
   runContainerAgent,
   writeGroupsSnapshot,
   writeTasksSnapshot,
@@ -42,7 +47,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { findChannel, formatMessages, formatOutbound, parseImageRefs, stripImageRefs } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -140,6 +145,66 @@ export function _setChannels(chs: Channel[]): void {
   channels.push(...chs);
 }
 
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // 5MB per image
+const MIME_MAP: Record<string, string> = {
+  '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.png': 'image/png', '.webp': 'image/webp',
+  '.gif': 'image/gif',
+};
+
+/**
+ * Pre-download images from messages and return media attachments + stripped messages.
+ * Successfully downloaded images become vision content blocks; failed ones keep
+ * their [图片 ...] refs intact for MCP fallback.
+ */
+async function preDownloadImages(
+  channel: Channel,
+  messages: NewMessage[],
+): Promise<{ media: MediaAttachment[]; strippedMessages: NewMessage[] }> {
+  const media: MediaAttachment[] = [];
+  const downloadedKeys = new Set<string>();
+  const allRefs = messages.flatMap((m) => parseImageRefs(m.content));
+
+  if (allRefs.length > 0 && channel.downloadMedia) {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-media-'));
+    try {
+      const results = await Promise.allSettled(
+        allRefs.map(async (ref, idx) => {
+          const filename = await channel.downloadMedia!(
+            ref.messageId, ref.imageKey, tmpDir, `img-${idx}-${Date.now()}`,
+          );
+          if (!filename) return null;
+          const filePath = path.join(tmpDir, filename);
+          const stat = fs.statSync(filePath);
+          if (stat.size > MAX_IMAGE_BYTES) {
+            logger.warn({ imageKey: ref.imageKey, size: stat.size }, 'Image too large for vision, keeping ref for MCP fallback');
+            return null;
+          }
+          const data = fs.readFileSync(filePath).toString('base64');
+          const ext = path.extname(filename).toLowerCase();
+          return { ref, data, mediaType: MIME_MAP[ext] || 'image/png' };
+        }),
+      );
+      for (const result of results) {
+        if (result.status === 'fulfilled' && result.value) {
+          media.push({ data: result.value.data, mediaType: result.value.mediaType });
+          downloadedKeys.add(result.value.ref.imageKey);
+        } else if (result.status === 'rejected') {
+          logger.warn({ err: result.reason }, 'Failed to pre-download image, keeping ref for MCP fallback');
+        }
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  }
+
+  const strippedMessages = downloadedKeys.size > 0
+    ? messages.map((m) => ({ ...m, content: stripImageRefs(m.content, downloadedKeys) }))
+    : messages;
+
+  return { media, strippedMessages };
+}
+
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
@@ -177,7 +242,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
-  const prompt = formatMessages(missedMessages);
+  const { media, strippedMessages } = await preDownloadImages(channel, missedMessages);
+  const prompt = formatMessages(strippedMessages);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -207,6 +273,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
+  const mediaToSend = media.length > 0 ? media : undefined;
   const output = await runAgent(group, prompt, chatJid, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
@@ -232,7 +299,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (result.status === 'error') {
       hadError = true;
     }
-  });
+  }, mediaToSend);
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
@@ -262,6 +329,7 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  media?: MediaAttachment[],
 ): Promise<'success' | 'error'> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
   const sessionId = sessions[group.folder];
@@ -307,6 +375,7 @@ async function runAgent(
       group,
       {
         prompt,
+        media,
         sessionId,
         groupFolder: group.folder,
         chatJid,
@@ -401,9 +470,14 @@ async function startMessageLoop(): Promise<void> {
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
-          const formatted = formatMessages(messagesToSend);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          // Pre-download images for both piping and new-container paths
+          const { media: pipedMedia, strippedMessages: strippedToSend } =
+            await preDownloadImages(channel, messagesToSend);
+          const formatted = formatMessages(strippedToSend);
+          const pipedMediaToSend = pipedMedia.length > 0 ? pipedMedia : undefined;
+
+          if (queue.sendMessage(chatJid, formatted, pipedMediaToSend)) {
             logger.debug(
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
@@ -543,8 +617,19 @@ async function main(): Promise<void> {
     await feishu.connect();
   }
 
+  // DingTalk (if credentials configured)
+  if (DINGTALK_APP_KEY && DINGTALK_APP_SECRET) {
+    const dingtalk = new DingTalkChannel({
+      onMessage,
+      onChatMetadata,
+      registeredGroups: () => registeredGroups,
+    });
+    channels.push(dingtalk);
+    await dingtalk.connect();
+  }
+
   if (channels.length === 0) {
-    logger.error('No channels configured. Set WhatsApp or Feishu credentials.');
+    logger.error('No channels configured. Set WhatsApp, Feishu, or DingTalk credentials.');
     process.exit(1);
   }
 

@@ -31,8 +31,14 @@ import { RegisteredGroup } from './types.js';
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
+export interface MediaAttachment {
+  data: string;       // base64-encoded image data
+  mediaType: string;  // "image/jpeg" | "image/png" | "image/webp" | "image/gif"
+}
+
 export interface ContainerInput {
   prompt: string;
+  media?: MediaAttachment[];
   sessionId?: string;
   groupFolder: string;
   chatJid: string;
@@ -198,6 +204,9 @@ function readSecrets(): Record<string, string> {
     'FEISHU_APP_ID',
     'FEISHU_APP_SECRET',
     'FEISHU_DOMAIN',
+    'DINGTALK_APP_KEY',
+    'DINGTALK_APP_SECRET',
+    'DINGTALK_ROBOT_CODE',
   ]);
 }
 
@@ -285,8 +294,9 @@ export async function runContainerAgent(
     input.secrets = readSecrets();
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
-    // Remove secrets from input so they don't appear in logs
+    // Remove secrets and media from input so they don't appear in logs
     delete input.secrets;
+    delete input.media;
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';

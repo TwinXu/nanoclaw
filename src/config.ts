@@ -68,6 +68,11 @@ export const FEISHU_APP_ID = process.env.FEISHU_APP_ID || '';
 export const FEISHU_APP_SECRET = process.env.FEISHU_APP_SECRET || '';
 export const FEISHU_DOMAIN = process.env.FEISHU_DOMAIN || 'feishu'; // 'feishu' | 'lark'
 
+// DingTalk
+export const DINGTALK_APP_KEY = process.env.DINGTALK_APP_KEY || '';
+export const DINGTALK_APP_SECRET = process.env.DINGTALK_APP_SECRET || '';
+export const DINGTALK_ROBOT_CODE = process.env.DINGTALK_ROBOT_CODE || '';
+
 // Channel toggles
 export const WHATSAPP_DISABLED = process.env.WHATSAPP_DISABLED === 'true';
 

@@ -1,28 +1,43 @@
 # Intent: src/index.ts modifications
 
 ## What changed
-Added DingTalk channel registration block following the same pattern as Feishu.
+1. Added DingTalk channel registration block following the same pattern as Feishu.
+2. Added media pre-download infrastructure for vision content blocks.
 
 ## Key sections
 
 ### Imports (top of file)
+- Added: `os` from node builtins
 - Added: `DingTalkChannel` from `./channels/dingtalk.js`
 - Added: `DINGTALK_APP_KEY`, `DINGTALK_APP_SECRET` from `./config.js`
+- Added: `MediaAttachment` from `./container-runner.js`
+- Added: `parseImageRefs`, `stripImageRefs` from `./router.js`
+
+### preDownloadImages() helper (before processGroupMessages)
+- New function that extracts `[图片 image_key=... message_id=...]` refs from messages
+- Downloads images via `channel.downloadMedia()` in parallel (`Promise.allSettled`)
+- Converts to base64 `MediaAttachment` objects with 5MB size limit
+- Strips downloaded refs from message content; keeps failed ones for MCP fallback
+- Returns `{ media, strippedMessages }`
+
+### processGroupMessages()
+- Calls `preDownloadImages()` before `formatMessages()`
+- Passes `media` array through `runAgent()` → `runContainerAgent()`
+
+### startMessageLoop() — piping path
+- Calls `preDownloadImages()` before formatting piped messages
+- Passes media to `queue.sendMessage()` for IPC delivery
+
+### runAgent()
+- Added optional `media?: MediaAttachment[]` parameter
+- Passes `media` into `ContainerInput`
 
 ### main() — Channel setup section
-- Added: Conditional DingTalk channel creation after Feishu block:
-  ```typescript
-  if (DINGTALK_APP_KEY && DINGTALK_APP_SECRET) {
-    const dingtalk = new DingTalkChannel({ onMessage, onChatMetadata, registeredGroups: () => registeredGroups });
-    channels.push(dingtalk);
-    await dingtalk.connect();
-  }
-  ```
-- Changed: Error message when no channels configured — now mentions DingTalk alongside WhatsApp and Feishu
+- Added: Conditional DingTalk channel creation after Feishu block
+- Changed: Error message when no channels configured — now mentions DingTalk
 
 ## Invariants
 - All existing message processing logic (triggers, cursors, idle timers) is preserved
-- The `runAgent` function is completely unchanged
 - State management (loadState/saveState) is unchanged
 - Recovery logic is unchanged
 - Container runtime check is unchanged
