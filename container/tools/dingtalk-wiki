@@ -1,0 +1,473 @@
+#!/usr/bin/env node
+// dingtalk-wiki — CLI tool to read DingTalk wiki / knowledge base content
+// No npm dependencies; uses built-in fetch (Node 18+)
+
+const DINGTALK_APP_KEY = process.env.DINGTALK_APP_KEY;
+const DINGTALK_APP_SECRET = process.env.DINGTALK_APP_SECRET;
+
+const BASE = 'https://api.dingtalk.com';
+const OAPI_BASE = 'https://oapi.dingtalk.com';
+
+// ─── Auth ────────────────────────────────────────────────────────────
+
+let _tokenCache = null;
+
+async function getAccessToken() {
+  if (_tokenCache && Date.now() < _tokenCache.expiresAt) {
+    return _tokenCache.token;
+  }
+  if (!DINGTALK_APP_KEY || !DINGTALK_APP_SECRET) {
+    fatal('DINGTALK_APP_KEY and DINGTALK_APP_SECRET must be set');
+  }
+  const res = await fetch(`${BASE}/v1.0/oauth2/accessToken`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      appKey: DINGTALK_APP_KEY,
+      appSecret: DINGTALK_APP_SECRET,
+    }),
+  });
+  const data = await res.json();
+  if (!data.accessToken) {
+    fatal(`Auth failed: ${JSON.stringify(data)}`);
+  }
+  _tokenCache = {
+    token: data.accessToken,
+    expiresAt: Date.now() + (data.expireIn - 60) * 1000,
+  };
+  return _tokenCache.token;
+}
+
+// ─── HTTP helpers ────────────────────────────────────────────────────
+
+async function api(path, opts = {}) {
+  const token = await getAccessToken();
+  const url = path.startsWith('http') ? path : `${BASE}${path}`;
+  const res = await fetch(url, {
+    ...opts,
+    headers: {
+      'x-acs-dingtalk-access-token': token,
+      'Content-Type': 'application/json',
+      ...opts.headers,
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    fatal(`API error (${res.status}): ${text}\n  ${path}`);
+  }
+  const data = await res.json();
+  return data;
+}
+
+async function apiOld(path) {
+  const token = await getAccessToken();
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `${OAPI_BASE}${path}${sep}access_token=${token}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    const text = await res.text();
+    fatal(`API error (${res.status}): ${text}\n  ${path}`);
+  }
+  const data = await res.json();
+  if (data.errcode && data.errcode !== 0) {
+    fatal(`API error (code ${data.errcode}): ${data.errmsg}\n  ${path}`);
+  }
+  return data;
+}
+
+// ─── URL / token parsing ─────────────────────────────────────────────
+
+function parseUrlOrToken(input) {
+  // URL formats:
+  //   https://alidocs.dingtalk.com/i/nodes/ABC123
+  //   https://alidocs.dingtalk.com/i/spaces/ABC123/nodes/DEF456
+  //   Plain token: ABC123
+  const nodeMatch = input.match(
+    /alidocs\.dingtalk\.com\/i\/(?:spaces\/[A-Za-z0-9]+\/)?nodes\/([A-Za-z0-9]+)/,
+  );
+  if (nodeMatch) return { nodeId: nodeMatch[1] };
+
+  const spaceMatch = input.match(
+    /alidocs\.dingtalk\.com\/i\/spaces\/([A-Za-z0-9]+)/,
+  );
+  if (spaceMatch) return { spaceId: spaceMatch[1] };
+
+  // Bare token
+  if (/^[A-Za-z0-9]+$/.test(input)) return { nodeId: input };
+  fatal(`Cannot parse token from: ${input}`);
+}
+
+// ─── API wrappers ────────────────────────────────────────────────────
+
+async function listWorkspaces(unionId) {
+  const items = [];
+  let nextToken = undefined;
+  do {
+    const body = { maxResults: 50 };
+    if (nextToken) body.nextToken = nextToken;
+    if (unionId) body.unionId = unionId;
+    const data = await api('/v1.0/doc/workspaces/query', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+    if (data.items) items.push(...data.items);
+    nextToken = data.nextToken || undefined;
+  } while (nextToken);
+
+  if (!items.length) {
+    console.log('No workspaces found.');
+    return;
+  }
+  console.log('Workspaces:\n');
+  for (const w of items) {
+    console.log(`  ${w.name}`);
+    console.log(`    ID: ${w.workspaceId}`);
+    if (w.url) console.log(`    URL: ${w.url}`);
+    console.log();
+  }
+}
+
+async function listNodes(workspaceId, parentNodeId) {
+  const items = [];
+  let nextToken = undefined;
+  do {
+    const params = new URLSearchParams({ maxResults: '50' });
+    if (parentNodeId) params.set('parentNodeId', parentNodeId);
+    if (nextToken) params.set('nextToken', nextToken);
+    const data = await api(
+      `/v1.0/doc/workspaces/${workspaceId}/nodes?${params}`,
+    );
+    if (data.nodes) items.push(...data.nodes);
+    nextToken = data.nextToken || undefined;
+  } while (nextToken);
+
+  if (!items.length) {
+    console.log('No nodes found.');
+    return;
+  }
+  const label = parentNodeId
+    ? `Child nodes of ${parentNodeId}`
+    : `Nodes in workspace ${workspaceId}`;
+  console.log(`${label}:\n`);
+  for (const n of items) {
+    const type = n.nodeType || 'unknown';
+    console.log(`  ${n.name} [${type}]`);
+    console.log(`    Node ID: ${n.nodeId}`);
+    if (n.docKey) console.log(`    Doc key: ${n.docKey}`);
+    if (n.hasChildren) console.log(`    Has children: yes`);
+    if (n.url) console.log(`    URL: ${n.url}`);
+    console.log();
+  }
+}
+
+async function getNode(workspaceId, nodeId) {
+  const data = await api(
+    `/v1.0/doc/workspaces/${workspaceId}/nodes/${nodeId}`,
+  );
+  const n = data.node || data;
+  console.log(`Node: ${n.name}`);
+  console.log(`  Type: ${n.nodeType}`);
+  console.log(`  Node ID: ${n.nodeId}`);
+  if (n.docKey) console.log(`  Doc key: ${n.docKey}`);
+  if (n.workspaceId) console.log(`  Workspace ID: ${n.workspaceId}`);
+  if (n.parentNodeId) console.log(`  Parent: ${n.parentNodeId}`);
+  if (n.hasChildren) console.log(`  Has children: yes`);
+  if (n.url) console.log(`  URL: ${n.url}`);
+}
+
+async function readDocument(workspaceId, nodeId) {
+  // Get node info to determine type
+  const nodeData = await api(
+    `/v1.0/doc/workspaces/${workspaceId}/nodes/${nodeId}`,
+  );
+  const node = nodeData.node || nodeData;
+  const docKey = node.docKey || nodeId;
+  const nodeType = node.nodeType || '';
+
+  if (nodeType === 'alidoc_sheet' || nodeType === 'sheet') {
+    await readSheet(docKey);
+    return;
+  }
+
+  // Read document body blocks
+  const blocks = [];
+  let nextToken = undefined;
+  do {
+    const params = new URLSearchParams({ maxResults: '100' });
+    if (nextToken) params.set('nextToken', nextToken);
+    const data = await api(
+      `/v1.0/doc/documents/${docKey}/blocks?${params}`,
+    );
+    if (data.children) blocks.push(...data.children);
+    nextToken = data.nextToken || undefined;
+  } while (nextToken);
+
+  if (!blocks.length) {
+    // Fallback: try the raw content endpoint
+    try {
+      const raw = await api(`/v1.0/doc/documents/${docKey}`);
+      if (raw.body?.content) {
+        console.log(raw.body.content);
+        return;
+      }
+    } catch {
+      // ignore fallback failure
+    }
+    console.log('(empty document)');
+    return;
+  }
+
+  // Convert blocks to plain text
+  const text = blocksToText(blocks);
+  console.log(text);
+}
+
+function blocksToText(blocks, indent = '') {
+  const lines = [];
+  for (const block of blocks) {
+    const type = block.type || '';
+    const body = block.body || {};
+
+    if (type === 'paragraph' || type === 'text') {
+      const text = extractText(body);
+      if (text) lines.push(indent + text);
+    } else if (type === 'heading' || type.startsWith('heading')) {
+      const level = block.level || parseInt(type.replace(/\D/g, '')) || 1;
+      const text = extractText(body);
+      if (text) lines.push(indent + '#'.repeat(level) + ' ' + text);
+    } else if (type === 'bulletList' || type === 'bullet_list') {
+      const text = extractText(body);
+      if (text) lines.push(indent + '- ' + text);
+      if (block.children) {
+        lines.push(blocksToText(block.children, indent + '  '));
+      }
+    } else if (type === 'orderedList' || type === 'ordered_list') {
+      const text = extractText(body);
+      if (text) lines.push(indent + '1. ' + text);
+      if (block.children) {
+        lines.push(blocksToText(block.children, indent + '  '));
+      }
+    } else if (type === 'codeBlock' || type === 'code_block') {
+      const text = extractText(body);
+      if (text) {
+        lines.push(indent + '```');
+        lines.push(indent + text);
+        lines.push(indent + '```');
+      }
+    } else if (type === 'table') {
+      // Tables: render as TSV
+      if (block.children) {
+        for (const row of block.children) {
+          if (row.children) {
+            const cells = row.children.map((cell) => extractText(cell.body || {}));
+            lines.push(indent + cells.join('\t'));
+          }
+        }
+      }
+    } else {
+      // Generic: extract any text content
+      const text = extractText(body);
+      if (text) lines.push(indent + text);
+      if (block.children) {
+        lines.push(blocksToText(block.children, indent));
+      }
+    }
+  }
+  return lines.filter(Boolean).join('\n');
+}
+
+function extractText(body) {
+  if (!body) return '';
+  // body.text is the simplest case
+  if (typeof body.text === 'string') return body.text;
+  // body.content may be an array of inline elements
+  if (Array.isArray(body.content)) {
+    return body.content
+      .map((c) => {
+        if (typeof c === 'string') return c;
+        if (c.text) return c.text;
+        if (c.content) return extractText(c);
+        return '';
+      })
+      .join('');
+  }
+  // body may have a nested body
+  if (body.body) return extractText(body.body);
+  return '';
+}
+
+const MAX_SHEET_ROWS = 1000;
+
+function colToLetter(col) {
+  let s = '';
+  while (col > 0) {
+    col--;
+    s = String.fromCharCode(65 + (col % 26)) + s;
+    col = Math.floor(col / 26);
+  }
+  return s;
+}
+
+async function readSheet(docKey) {
+  // Get sheet metadata
+  const meta = await api(`/v1.0/doc/documents/${docKey}/sheets`);
+  const sheets = meta.sheets || meta.items || [];
+
+  if (!sheets.length) {
+    console.log('(empty spreadsheet)');
+    return;
+  }
+
+  for (let i = 0; i < sheets.length; i++) {
+    const sheet = sheets[i];
+    const sheetId = sheet.id || sheet.sheetId;
+    const title = sheet.name || sheet.title || `Sheet ${i + 1}`;
+
+    if (sheets.length > 1) {
+      console.log(`--- Sheet: ${title} ---\n`);
+    }
+
+    const rowCount = sheet.rowCount || MAX_SHEET_ROWS;
+    const columnCount = sheet.columnCount || 26;
+    const readRows = Math.min(rowCount, MAX_SHEET_ROWS);
+    const endCol = colToLetter(columnCount);
+    const range = `A1:${endCol}${readRows}`;
+
+    try {
+      const result = await api(
+        `/v1.0/doc/documents/${docKey}/sheets/${sheetId}/ranges/${range}`,
+      );
+
+      const rows = result.values || [];
+      for (const row of rows) {
+        const cells = Array.isArray(row)
+          ? row.map((c) =>
+              c == null ? '' : String(c).replace(/[\t\r\n]+/g, ' '),
+            )
+          : [];
+        console.log(cells.join('\t'));
+      }
+
+      if (rowCount > MAX_SHEET_ROWS) {
+        console.log(
+          `\n... (${rowCount - MAX_SHEET_ROWS} more rows truncated)`,
+        );
+      }
+    } catch (err) {
+      console.log(`(failed to read sheet: ${err.message})`);
+    }
+
+    if (i < sheets.length - 1) console.log();
+  }
+}
+
+// ─── Search ──────────────────────────────────────────────────────────
+
+async function searchDocs(keyword, workspaceId) {
+  const body = { keyword, maxResults: 20 };
+  if (workspaceId) body.workspaceId = workspaceId;
+  const data = await api('/v1.0/doc/docs/search', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  const items = data.items || data.docs || [];
+  if (!items.length) {
+    console.log(`No documents found for "${keyword}".`);
+    return;
+  }
+  console.log(`Search results for "${keyword}":\n`);
+  for (const doc of items) {
+    console.log(`  ${doc.name || doc.title}`);
+    if (doc.nodeId) console.log(`    Node ID: ${doc.nodeId}`);
+    if (doc.docKey) console.log(`    Doc key: ${doc.docKey}`);
+    if (doc.workspaceId) console.log(`    Workspace: ${doc.workspaceId}`);
+    if (doc.nodeType) console.log(`    Type: ${doc.nodeType}`);
+    if (doc.url) console.log(`    URL: ${doc.url}`);
+    console.log();
+  }
+}
+
+// ─── CLI ─────────────────────────────────────────────────────────────
+
+function fatal(msg) {
+  console.error(`Error: ${msg}`);
+  process.exit(1);
+}
+
+function usage() {
+  console.log(`Usage:
+  dingtalk-wiki spaces                              List workspaces (knowledge bases)
+  dingtalk-wiki nodes <workspace_id>                List top-level nodes in a workspace
+  dingtalk-wiki nodes <workspace_id> -p <node_id>   List child nodes under a parent
+  dingtalk-wiki read <workspace_id> <url_or_node_id> Read document content as plain text
+  dingtalk-wiki node <workspace_id> <url_or_node_id> Get node info (type, title, IDs)
+  dingtalk-wiki search <keyword>                    Search documents by keyword
+  dingtalk-wiki search <keyword> -w <workspace_id>  Search within a workspace
+
+Environment:
+  DINGTALK_APP_KEY      DingTalk app key (required)
+  DINGTALK_APP_SECRET   DingTalk app secret (required)`);
+  process.exit(0);
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (!args.length) usage();
+
+  const cmd = args[0];
+
+  switch (cmd) {
+    case 'spaces':
+      await listWorkspaces(args[1]);
+      break;
+
+    case 'nodes': {
+      const workspaceId = args[1];
+      if (!workspaceId) fatal('Usage: dingtalk-wiki nodes <workspace_id> [-p <parent_node_id>]');
+      const pIdx = args.indexOf('-p');
+      const parentNodeId = pIdx !== -1 ? args[pIdx + 1] : undefined;
+      await listNodes(workspaceId, parentNodeId);
+      break;
+    }
+
+    case 'read': {
+      const workspaceId = args[1];
+      const input = args[2];
+      if (!workspaceId || !input) fatal('Usage: dingtalk-wiki read <workspace_id> <url_or_node_id>');
+      const parsed = parseUrlOrToken(input);
+      await readDocument(workspaceId, parsed.nodeId || input);
+      break;
+    }
+
+    case 'node': {
+      const workspaceId = args[1];
+      const input = args[2];
+      if (!workspaceId || !input) fatal('Usage: dingtalk-wiki node <workspace_id> <url_or_node_id>');
+      const parsed = parseUrlOrToken(input);
+      await getNode(workspaceId, parsed.nodeId || input);
+      break;
+    }
+
+    case 'search': {
+      const keyword = args[1];
+      if (!keyword) fatal('Usage: dingtalk-wiki search <keyword> [-w <workspace_id>]');
+      const wIdx = args.indexOf('-w');
+      const workspaceId = wIdx !== -1 ? args[wIdx + 1] : undefined;
+      await searchDocs(keyword, workspaceId);
+      break;
+    }
+
+    case 'help':
+    case '--help':
+    case '-h':
+      usage();
+      break;
+
+    default:
+      fatal(`Unknown command: ${cmd}\nRun "dingtalk-wiki help" for usage.`);
+  }
+}
+
+main().catch((err) => {
+  fatal(err.message || String(err));
+});

@@ -34,7 +34,8 @@ RUN npm install -g agent-browser @anthropic-ai/claude-code
 
 # Install CLI tools
 COPY tools/feishu-wiki /usr/local/bin/feishu-wiki
-RUN chmod +x /usr/local/bin/feishu-wiki
+COPY tools/dingtalk-wiki /usr/local/bin/dingtalk-wiki
+RUN chmod +x /usr/local/bin/feishu-wiki /usr/local/bin/dingtalk-wiki
 
 # Create app directory
 WORKDIR /app
