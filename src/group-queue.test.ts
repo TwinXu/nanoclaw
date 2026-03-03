@@ -166,6 +166,64 @@ describe('GroupQueue', () => {
     expect(callCount).toBe(3);
   });
 
+  // --- enqueueMessageCheck return values ---
+
+  it('returns "processing" when container starts immediately', () => {
+    queue.setProcessMessagesFn(vi.fn(async () => true));
+    const result = queue.enqueueMessageCheck('group1@g.us');
+    expect(result).toBe('processing');
+  });
+
+  it('returns "queued" when container is active', async () => {
+    let resolveFirst: () => void;
+    queue.setProcessMessagesFn(
+      vi.fn(async () => {
+        await new Promise<void>((resolve) => {
+          resolveFirst = resolve;
+        });
+        return true;
+      }),
+    );
+
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = queue.enqueueMessageCheck('group1@g.us');
+    expect(result).toBe('queued');
+
+    resolveFirst!();
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('returns "queued" when at concurrency limit', async () => {
+    const completionCallbacks: Array<() => void> = [];
+    queue.setProcessMessagesFn(
+      vi.fn(async () => {
+        await new Promise<void>((resolve) => completionCallbacks.push(resolve));
+        return true;
+      }),
+    );
+
+    // Fill both slots (MAX_CONCURRENT_CONTAINERS = 2)
+    queue.enqueueMessageCheck('group1@g.us');
+    queue.enqueueMessageCheck('group2@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = queue.enqueueMessageCheck('group3@g.us');
+    expect(result).toBe('queued');
+
+    completionCallbacks.forEach((cb) => cb());
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('returns "dropped" after shutdown', async () => {
+    queue.setProcessMessagesFn(vi.fn(async () => true));
+    await queue.shutdown(1000);
+
+    const result = queue.enqueueMessageCheck('group1@g.us');
+    expect(result).toBe('dropped');
+  });
+
   // --- Shutdown prevents new enqueues ---
 
   it('prevents new enqueues after shutdown', async () => {
@@ -376,6 +434,46 @@ describe('GroupQueue', () => {
 
     resolveTask!();
     await vi.advanceTimersByTimeAsync(10);
+  });
+
+  // --- getActiveMessageGroups ---
+
+  it('returns JIDs of groups with active message containers', async () => {
+    let resolveProcess: () => void;
+    let resolveTask: () => void;
+
+    queue.setProcessMessagesFn(
+      vi.fn(async () => {
+        await new Promise<void>((resolve) => {
+          resolveProcess = resolve;
+        });
+        return true;
+      }),
+    );
+
+    // Start a message container
+    queue.enqueueMessageCheck('group1@g.us');
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Start a task container
+    queue.enqueueTask('group2@g.us', 'task-1', vi.fn(async () => {
+      await new Promise<void>((resolve) => {
+        resolveTask = resolve;
+      });
+    }));
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Only message container should be returned
+    const activeGroups = queue.getActiveMessageGroups();
+    expect(activeGroups).toEqual(['group1@g.us']);
+
+    resolveProcess!();
+    resolveTask!();
+    await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it('returns empty array when no active containers', () => {
+    expect(queue.getActiveMessageGroups()).toEqual([]);
   });
 
   it('preempts when idle arrives with pending tasks', async () => {

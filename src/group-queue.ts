@@ -57,15 +57,15 @@ export class GroupQueue {
     this.processMessagesFn = fn;
   }
 
-  enqueueMessageCheck(groupJid: string): void {
-    if (this.shuttingDown) return;
+  enqueueMessageCheck(groupJid: string): 'queued' | 'processing' | 'dropped' {
+    if (this.shuttingDown) return 'dropped';
 
     const state = this.getGroup(groupJid);
 
     if (state.active) {
       state.pendingMessages = true;
       logger.debug({ groupJid }, 'Container active, message queued');
-      return;
+      return 'queued';
     }
 
     if (this.activeCount >= MAX_CONCURRENT_CONTAINERS) {
@@ -77,12 +77,13 @@ export class GroupQueue {
         { groupJid, activeCount: this.activeCount },
         'At concurrency limit, message queued',
       );
-      return;
+      return 'queued';
     }
 
     this.runForGroup(groupJid, 'messages').catch((err) =>
       logger.error({ groupJid, err }, 'Unhandled error in runForGroup'),
     );
+    return 'processing';
   }
 
   enqueueTask(groupJid: string, taskId: string, fn: () => Promise<void>): void {
@@ -316,6 +317,19 @@ export class GroupQueue {
       }
       // If neither pending, skip this group
     }
+  }
+
+  /**
+   * Returns JIDs of groups with active message containers (not task containers).
+   */
+  getActiveMessageGroups(): string[] {
+    const result: string[] = [];
+    for (const [jid, state] of this.groups) {
+      if (state.active && !state.isTaskContainer) {
+        result.push(jid);
+      }
+    }
+    return result;
   }
 
   async shutdown(_gracePeriodMs: number): Promise<void> {

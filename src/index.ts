@@ -58,6 +58,9 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+const queuedNotifyTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const queuedNotifiedGroups = new Set<string>();
+const preProcessingCursors = new Map<string, string>();
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -142,6 +145,14 @@ export function _setChannels(chs: Channel[]): void {
  * Called by the GroupQueue when it's this group's turn.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
+  // Cancel queued notification timer — this group is now being processed
+  const notifyTimer = queuedNotifyTimers.get(chatJid);
+  if (notifyTimer) {
+    clearTimeout(notifyTimer);
+    queuedNotifyTimers.delete(chatJid);
+  }
+  queuedNotifiedGroups.delete(chatJid);
+
   const group = registeredGroups[chatJid];
   if (!group) return true;
 
@@ -171,6 +182,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
   const previousCursor = lastAgentTimestamp[chatJid] || '';
+  preProcessingCursors.set(chatJid, previousCursor);
   lastAgentTimestamp[chatJid] =
     missedMessages[missedMessages.length - 1].timestamp;
   saveState();
@@ -230,15 +242,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
       logger.warn({ group: group.name }, 'Agent error after output was sent, skipping cursor rollback to prevent duplicates');
+      preProcessingCursors.delete(chatJid);
       return true;
     }
     // Roll back cursor so retries can re-process these messages
     lastAgentTimestamp[chatJid] = previousCursor;
     saveState();
+    preProcessingCursors.delete(chatJid);
     logger.warn({ group: group.name }, 'Agent error, rolled back message cursor for retry');
     return false;
   }
 
+  preProcessingCursors.delete(chatJid);
   return true;
 }
 
@@ -393,16 +408,40 @@ async function startMessageLoop(): Promise<void> {
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
             );
+            // Advance rollback cursor to just before this piped batch so shutdown
+            // only re-processes the latest piped messages, not the entire session.
+            preProcessingCursors.set(chatJid, lastAgentTimestamp[chatJid] || '');
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
+            // Message reached a running container — cancel any pending notification
+            const existingTimer = queuedNotifyTimers.get(chatJid);
+            if (existingTimer) {
+              clearTimeout(existingTimer);
+              queuedNotifyTimers.delete(chatJid);
+            }
             // Show typing indicator while the container processes the piped message
             channel.setTyping?.(chatJid, true)?.catch((err) =>
               logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
             );
           } else {
             // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
+            const enqueueResult = queue.enqueueMessageCheck(chatJid);
+            if (enqueueResult === 'queued' && !queuedNotifyTimers.has(chatJid) && !queuedNotifiedGroups.has(chatJid)) {
+              const lastMsg = messagesToSend[messagesToSend.length - 1].content;
+              const isChinese = /[\u4e00-\u9fff]/.test(lastMsg);
+              const notifyText = isChinese
+                ? '消息已收到，当前正在处理其他任务，完成后将尽快回复。'
+                : 'Message received. Currently processing another task — will respond when done.';
+              const timer = setTimeout(() => {
+                queuedNotifyTimers.delete(chatJid);
+                queuedNotifiedGroups.add(chatJid);
+                channel.sendMessage(chatJid, notifyText).catch((err) =>
+                  logger.warn({ chatJid, err }, 'Failed to send queue notification'),
+                );
+              }, 10_000);
+              queuedNotifyTimers.set(chatJid, timer);
+            }
           }
         }
       }
@@ -445,6 +484,30 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+
+    // Clear all queued notification timers and sent-notification tracking
+    for (const timer of queuedNotifyTimers.values()) {
+      clearTimeout(timer);
+    }
+    queuedNotifyTimers.clear();
+    queuedNotifiedGroups.clear();
+
+    // Roll back cursors for groups with active message containers
+    // so their messages will be re-processed on restart
+    const activeMessageGroups = queue.getActiveMessageGroups();
+    for (const jid of activeMessageGroups) {
+      const savedCursor = preProcessingCursors.get(jid);
+      if (savedCursor !== undefined) {
+        lastAgentTimestamp[jid] = savedCursor;
+        logger.info({ jid, rolledBackTo: savedCursor }, 'Shutdown: rolled back message cursor');
+      } else {
+        logger.warn({ jid }, 'Shutdown: active group has no saved cursor, skipping rollback');
+      }
+    }
+    if (activeMessageGroups.length > 0) {
+      saveState();
+    }
+
     await queue.shutdown(10000);
     await Promise.all(channels.map((ch) => ch.disconnect()));
     process.exit(0);
