@@ -1,0 +1,21 @@
+skill: dingtalk
+version: 1.0.0
+description: "DingTalk bot integration via Stream Mode"
+core_version: 0.1.0
+adds:
+  - src/channels/dingtalk.ts
+  - src/channels/dingtalk.test.ts
+modifies:
+  - src/index.ts
+  - src/config.ts
+  - src/container-runner.ts
+structured:
+  npm_dependencies:
+    dingtalk-stream: "^2.1.4"
+  env_additions:
+    - DINGTALK_APP_KEY
+    - DINGTALK_APP_SECRET
+    - DINGTALK_ROBOT_CODE
+conflicts: []
+depends: []
+test: "npx vitest run src/channels/dingtalk.test.ts"
