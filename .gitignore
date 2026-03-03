@@ -38,3 +38,6 @@ _bmad/
 .nanoclaw/
 
 agents-sdk-docs
+
+# Test scripts
+_test-*
