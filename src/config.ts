@@ -9,6 +9,12 @@ import { readEnvFile } from './env.js';
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
+  'FEISHU_APP_ID',
+  'FEISHU_APP_SECRET',
+  'FEISHU_DOMAIN',
+  'DINGTALK_APP_KEY',
+  'DINGTALK_APP_SECRET',
+  'DINGTALK_ROBOT_CODE',
 ]);
 
 export const ASSISTANT_NAME =
@@ -64,14 +70,14 @@ export const TRIGGER_PATTERN = new RegExp(
 );
 
 // Feishu / Lark
-export const FEISHU_APP_ID = process.env.FEISHU_APP_ID || '';
-export const FEISHU_APP_SECRET = process.env.FEISHU_APP_SECRET || '';
-export const FEISHU_DOMAIN = process.env.FEISHU_DOMAIN || 'feishu'; // 'feishu' | 'lark'
+export const FEISHU_APP_ID = process.env.FEISHU_APP_ID || envConfig.FEISHU_APP_ID || '';
+export const FEISHU_APP_SECRET = process.env.FEISHU_APP_SECRET || envConfig.FEISHU_APP_SECRET || '';
+export const FEISHU_DOMAIN = process.env.FEISHU_DOMAIN || envConfig.FEISHU_DOMAIN || 'feishu'; // 'feishu' | 'lark'
 
 // DingTalk
-export const DINGTALK_APP_KEY = process.env.DINGTALK_APP_KEY || '';
-export const DINGTALK_APP_SECRET = process.env.DINGTALK_APP_SECRET || '';
-export const DINGTALK_ROBOT_CODE = process.env.DINGTALK_ROBOT_CODE || '';
+export const DINGTALK_APP_KEY = process.env.DINGTALK_APP_KEY || envConfig.DINGTALK_APP_KEY || '';
+export const DINGTALK_APP_SECRET = process.env.DINGTALK_APP_SECRET || envConfig.DINGTALK_APP_SECRET || '';
+export const DINGTALK_ROBOT_CODE = process.env.DINGTALK_ROBOT_CODE || envConfig.DINGTALK_ROBOT_CODE || '';
 
 // Channel toggles
 export const WHATSAPP_DISABLED = process.env.WHATSAPP_DISABLED === 'true';

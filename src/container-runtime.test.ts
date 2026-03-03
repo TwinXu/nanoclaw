@@ -133,13 +133,16 @@ describe('container-runtime', () => {
         ]);
       });
 
-      it('uses -v for read-write mounts', () => {
+      it('uses --mount for read-write mounts', () => {
         const args = buildMountArg({
           hostPath: '/host/path',
           containerPath: '/container/path',
           readonly: false,
         });
-        expect(args).toEqual(['-v', '/host/path:/container/path']);
+        expect(args).toEqual([
+          '--mount',
+          'type=bind,source=/host/path,target=/container/path',
+        ]);
       });
     });
 
