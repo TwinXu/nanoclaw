@@ -31,6 +31,13 @@ import { RegisteredGroup } from './types.js';
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
+// Skills that require specific env vars to be configured.
+// Skills not listed here are always synced.
+const SKILL_REQUIRED_ENV: Record<string, string[]> = {
+  'feishu-wiki': ['FEISHU_APP_ID', 'FEISHU_APP_SECRET'],
+  'dingtalk-wiki': ['DINGTALK_APP_KEY', 'DINGTALK_APP_SECRET'],
+};
+
 export interface MediaAttachment {
   data: string;       // base64-encoded image data
   mediaType: string;  // "image/jpeg" | "image/png" | "image/webp" | "image/gif"
@@ -131,14 +138,31 @@ function buildVolumeMounts(
   }
 
   // Sync skills from container/skills/ into each group's .claude/skills/
+  // Skills with required env vars are only synced when those vars are configured.
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
   if (fs.existsSync(skillsSrc)) {
+    const secrets = readSecrets();
+    const syncedSkills = new Set<string>();
     for (const skillDir of fs.readdirSync(skillsSrc)) {
       const srcDir = path.join(skillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
+      const requiredEnv = SKILL_REQUIRED_ENV[skillDir];
+      if (requiredEnv && !requiredEnv.every((k) => secrets[k])) continue;
       const dstDir = path.join(skillsDst, skillDir);
       fs.cpSync(srcDir, dstDir, { recursive: true });
+      syncedSkills.add(skillDir);
+    }
+    // Remove previously synced skills that are no longer eligible
+    if (fs.existsSync(skillsDst)) {
+      for (const dir of fs.readdirSync(skillsDst)) {
+        if (!syncedSkills.has(dir)) {
+          const stale = path.join(skillsDst, dir);
+          if (fs.statSync(stale).isDirectory()) {
+            fs.rmSync(stale, { recursive: true });
+          }
+        }
+      }
     }
   }
   mounts.push({
