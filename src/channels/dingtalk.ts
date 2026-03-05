@@ -69,7 +69,33 @@ export interface DingTalkRobotMessage {
   sessionWebhook: string;
   robotCode: string;
   msgtype: string;
-  text?: { content: string };
+  text?: {
+    content: string;
+    isReplyMsg?: boolean;
+    repliedMsg?: {
+      createdAt?: number;
+      senderId?: string;
+      msgType?: string;
+      msgId?: string;
+      content?: {
+        text?: string;
+        richText?: Array<{
+          msgType?: string;
+          type?: string;
+          content?: string;
+          text?: string;
+          atName?: string;
+        }>;
+      };
+    };
+  };
+  originalMsgId?: string;
+  quoteMessage?: {
+    msgId?: string;
+    msgtype?: string;
+    text?: { content: string };
+    senderNick?: string;
+  };
   content?: {
     richText?: Array<{
       type?: string;         // "picture" for images
@@ -77,6 +103,7 @@ export interface DingTalkRobotMessage {
       downloadCode?: string; // image download code
       pictureDownloadCode?: string; // alternative download code
     }>;
+    quoteContent?: string;
   };
   richText?: unknown; // legacy — actual data is in content.richText
   picture?: { picURL: string; downloadCode?: string };
@@ -125,6 +152,8 @@ export class DingTalkChannel implements Channel {
     this.client.registerCallbackListener(TOPIC_ROBOT, (res: DWClientDownStream) => {
       try {
         const msg: DingTalkRobotMessage = JSON.parse(res.data);
+        // Dump full raw payload for debugging media/file message handling
+        logger.debug({ rawPayload: res.data }, 'DingTalk raw payload dump');
         this.handleMessage(msg);
         // Acknowledge receipt to prevent DingTalk server retries (60s window)
         this.client!.socketCallBackResponse(res.headers.messageId, {});
@@ -356,10 +385,80 @@ export class DingTalkChannel implements Channel {
     }
   }
 
+  /** Extract quoted/replied message content as a readable prefix. */
+  private formatQuotedContent(msg: DingTalkRobotMessage): string {
+    const textField = msg.text;
+
+    // Path 1: repliedMsg with content (text or richText)
+    if (textField?.isReplyMsg && textField?.repliedMsg) {
+      const replied = textField.repliedMsg;
+      const content = replied.content;
+
+      if (content?.text) {
+        const quoteText = content.text.trim();
+        if (quoteText) return `[引用消息: "${quoteText}"]\n\n`;
+      }
+
+      if (content?.richText && Array.isArray(content.richText)) {
+        const parts: string[] = [];
+        for (const part of content.richText) {
+          if ((part.msgType === 'text' || part.type === 'text') && (part.content || part.text)) {
+            parts.push(part.content || part.text || '');
+          } else if (part.msgType === 'emoji' || part.type === 'emoji') {
+            parts.push(part.content || '[表情]');
+          } else if (part.msgType === 'picture' || part.type === 'picture') {
+            parts.push('[图片]');
+          } else if (part.msgType === 'at' || part.type === 'at') {
+            parts.push(`@${part.content || part.atName || '某人'}`);
+          } else if (part.text) {
+            parts.push(part.text);
+          }
+        }
+        const quoteText = parts.join('').trim();
+        if (quoteText) return `[引用消息: "${quoteText}"]\n\n`;
+      }
+
+      // repliedMsg exists but no extractable content
+      const msgType = replied.msgType;
+      const typeLabel = msgType && msgType !== 'unknownMsgType' ? msgType : '';
+      return typeLabel
+        ? `[引用了一条${typeLabel}消息]\n\n`
+        : `[引用了一条消息]\n\n`;
+    }
+
+    // Path 2: isReplyMsg without repliedMsg, only originalMsgId
+    if (textField?.isReplyMsg && !textField?.repliedMsg && msg.originalMsgId) {
+      return `[引用了一条消息]\n\n`;
+    }
+
+    // Path 3: quoteMessage (alternative quote format)
+    if (msg.quoteMessage) {
+      const quoteText = msg.quoteMessage.text?.content?.trim();
+      if (quoteText) {
+        const sender = msg.quoteMessage.senderNick;
+        return sender
+          ? `[引用 ${sender} 的消息: "${quoteText}"]\n\n`
+          : `[引用消息: "${quoteText}"]\n\n`;
+      }
+    }
+
+    // Path 4: content.quoteContent
+    if (msg.content?.quoteContent) {
+      return `[引用消息: "${msg.content.quoteContent}"]\n\n`;
+    }
+
+    return '';
+  }
+
   /** Parse message content. Returns plain text with media metadata tags. */
   private extractContent(msg: DingTalkRobotMessage): string {
     if (msg.msgtype === 'text' && msg.text) {
-      return msg.text.content.trim();
+      const textContent = msg.text.content.trim();
+      const quoted = this.formatQuotedContent(msg);
+      if (quoted) {
+        logger.info({ isReplyMsg: msg.text.isReplyMsg, hasQuoteMessage: !!msg.quoteMessage }, 'DingTalk quoted message detected');
+      }
+      return quoted + textContent;
     }
     if (msg.msgtype === 'richText' && msg.content?.richText) {
       // richText is an array of nodes: {type:"picture", downloadCode:...} and {text:...}
@@ -388,7 +487,7 @@ export class DingTalkChannel implements Channel {
     }
     if (msg.msgtype === 'file' && msg.file) {
       // DM-only: file messages use downloadCode for retrieval
-      return `[文件 file_key=${msg.file.downloadCode} file_name=${msg.file.fileName} message_id=${msg.msgId}]`;
+      return `[文件 file_key=${msg.file.downloadCode} file_name=${encodeURIComponent(msg.file.fileName)} message_id=${msg.msgId}]`;
     }
     return `[${msg.msgtype} message]`;
   }

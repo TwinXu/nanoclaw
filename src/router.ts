@@ -78,3 +78,28 @@ export function stripImageRefs(content: string, downloadedKeys: Set<string>): st
     },
   );
 }
+
+// --- File ref parsing (for DM file messages) ---
+
+export interface FileRef {
+  fileKey: string;
+  messageId: string;
+  fullMatch: string;
+}
+
+/** Parse DM file refs: [文件 file_key=... file_name=... message_id=...] */
+export function parseDmFileRefs(content: string): Array<FileRef & { fileName: string }> {
+  const re = /\[文件 file_key=(\S+) file_name=(\S+) message_id=(\S+)\]/g;
+  const refs: Array<FileRef & { fileName: string }> = [];
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(content)) !== null) {
+    refs.push({
+      fileKey: match[1],
+      fileName: match[2],
+      messageId: match[3],
+      fullMatch: match[0],
+    });
+  }
+  return refs;
+}
+

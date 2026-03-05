@@ -47,7 +47,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound, parseImageRefs, stripImageRefs } from './router.js';
+import { findChannel, formatMessages, formatOutbound, parseImageRefs, parseDmFileRefs, stripImageRefs } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -205,6 +205,98 @@ async function preDownloadImages(
   return { media, strippedMessages };
 }
 
+const MAX_FILE_BYTES = 50 * 1024 * 1024; // 50MB per file
+const FILE_MEDIA_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
+
+/**
+ * Pre-download files from DM file messages.
+ * Downloads to the group's IPC media directory so the agent can read them.
+ * Returns stripped messages with file paths replacing the ref tags.
+ */
+async function preDownloadFiles(
+  channel: Channel,
+  messages: NewMessage[],
+  groupFolder: string,
+): Promise<{ strippedMessages: NewMessage[] }> {
+  const downloadedKeys = new Set<string>();
+  const keyToPath = new Map<string, string>();
+
+  // Collect DM file refs, deduplicate by fileKey
+  const seen = new Set<string>();
+  const allRefs = messages.flatMap((m) => parseDmFileRefs(m.content))
+    .filter((ref) => {
+      if (seen.has(ref.fileKey)) return false;
+      seen.add(ref.fileKey);
+      return true;
+    });
+
+  if (allRefs.length > 0 && channel.downloadMedia) {
+    const mediaDir = path.join(DATA_DIR, 'ipc', groupFolder, 'media');
+    fs.mkdirSync(mediaDir, { recursive: true });
+
+    // Clean up old downloaded files to prevent disk bloat
+    try {
+      const now = Date.now();
+      for (const entry of fs.readdirSync(mediaDir)) {
+        const filePath = path.join(mediaDir, entry);
+        const stat = fs.statSync(filePath);
+        if (now - stat.mtimeMs > FILE_MEDIA_MAX_AGE_MS) {
+          fs.unlinkSync(filePath);
+        }
+      }
+    } catch (cleanupErr) {
+      logger.warn({ err: cleanupErr }, 'Failed to clean up old media files');
+    }
+
+    const results = await Promise.allSettled(
+      allRefs.map(async (ref, idx) => {
+        const requestId = `file-${idx}-${Date.now()}`;
+        const filename = await channel.downloadMedia!(
+          ref.messageId, ref.fileKey, mediaDir, requestId, 'file',
+        );
+        if (!filename) return null;
+        const hostPath = path.join(mediaDir, filename);
+        const stat = fs.statSync(hostPath);
+        if (stat.size > MAX_FILE_BYTES) {
+          logger.warn({ fileKey: ref.fileKey, size: stat.size }, 'File too large, removing');
+          fs.unlinkSync(hostPath);
+          return null;
+        }
+        const containerPath = `/workspace/ipc/media/${filename}`;
+        return { ref, hostPath, containerPath };
+      }),
+    );
+
+    for (const result of results) {
+      if (result.status === 'fulfilled' && result.value) {
+        downloadedKeys.add(result.value.ref.fileKey);
+        keyToPath.set(result.value.ref.fileKey, result.value.containerPath);
+        logger.info(
+          { fileKey: result.value.ref.fileKey, path: result.value.hostPath },
+          'File pre-downloaded for agent',
+        );
+      } else if (result.status === 'rejected') {
+        logger.warn({ err: result.reason }, 'Failed to pre-download file');
+      }
+    }
+  }
+
+  const strippedMessages = downloadedKeys.size > 0
+    ? messages.map((m) => {
+        const content = m.content.replace(
+          /\[文件 file_key=(\S+) file_name=(\S+) message_id=(\S+)\]/g,
+          (_full, fileKey: string, fileName: string) => {
+            const p = keyToPath.get(fileKey);
+            return p ? `[文件 ${decodeURIComponent(fileName)} 已下载到 ${p}]` : _full;
+          },
+        );
+        return { ...m, content };
+      })
+    : messages;
+
+  return { strippedMessages };
+}
+
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
@@ -243,7 +335,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   const { media, strippedMessages } = await preDownloadImages(channel, missedMessages);
-  const prompt = formatMessages(strippedMessages);
+  const { strippedMessages: fileStrippedMessages } = await preDownloadFiles(channel, strippedMessages, group.folder);
+  const prompt = formatMessages(fileStrippedMessages);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -474,7 +567,9 @@ async function startMessageLoop(): Promise<void> {
           // Pre-download images for both piping and new-container paths
           const { media: pipedMedia, strippedMessages: strippedToSend } =
             await preDownloadImages(channel, messagesToSend);
-          const formatted = formatMessages(strippedToSend);
+          const { strippedMessages: fileStrippedToSend } =
+            await preDownloadFiles(channel, strippedToSend, group.folder);
+          const formatted = formatMessages(fileStrippedToSend);
           const pipedMediaToSend = pipedMedia.length > 0 ? pipedMedia : undefined;
 
           if (queue.sendMessage(chatJid, formatted, pipedMediaToSend)) {

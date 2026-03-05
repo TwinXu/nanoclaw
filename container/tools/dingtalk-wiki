@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // dingtalk-wiki — CLI tool to read DingTalk wiki / knowledge base content
+// Uses v2.0 wiki API for workspaces/nodes, v1.0 doc API for document content
 // No npm dependencies; uses built-in fetch (Node 18+)
 
 const DINGTALK_APP_KEY = process.env.DINGTALK_APP_KEY;
@@ -38,6 +39,56 @@ async function getAccessToken() {
   return _tokenCache.token;
 }
 
+// ─── Operator ID (auto-resolve from admin) ──────────────────────────
+
+let _operatorIdCache = null;
+
+async function getOperatorId() {
+  if (_operatorIdCache) return _operatorIdCache;
+
+  const token = await getAccessToken();
+
+  // Step 1: Get admin list → find primary admin (sys_level=1)
+  const adminRes = await fetch(
+    `${OAPI_BASE}/topapi/user/listadmin?access_token=${token}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    },
+  );
+  const adminData = await adminRes.json();
+  if (adminData.errcode && adminData.errcode !== 0) {
+    fatal(`Failed to get admin list: ${adminData.errmsg}`);
+  }
+  const admins = adminData.result || [];
+  const admin = admins.find((a) => a.sys_level === 1) || admins[0];
+  if (!admin) {
+    fatal('No admin found in organization');
+  }
+
+  // Step 2: Get user detail → extract unionId
+  const userRes = await fetch(
+    `${OAPI_BASE}/topapi/v2/user/get?access_token=${token}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userid: admin.userid }),
+    },
+  );
+  const userData = await userRes.json();
+  if (userData.errcode && userData.errcode !== 0) {
+    fatal(`Failed to get user detail: ${userData.errmsg}`);
+  }
+  const unionId = userData.result?.unionid;
+  if (!unionId) {
+    fatal(`No unionId found for admin user ${admin.userid}`);
+  }
+
+  _operatorIdCache = unionId;
+  return unionId;
+}
+
 // ─── HTTP helpers ────────────────────────────────────────────────────
 
 async function api(path, opts = {}) {
@@ -59,22 +110,6 @@ async function api(path, opts = {}) {
   return data;
 }
 
-async function apiOld(path) {
-  const token = await getAccessToken();
-  const sep = path.includes('?') ? '&' : '?';
-  const url = `${OAPI_BASE}${path}${sep}access_token=${token}`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    const text = await res.text();
-    fatal(`API error (${res.status}): ${text}\n  ${path}`);
-  }
-  const data = await res.json();
-  if (data.errcode && data.errcode !== 0) {
-    fatal(`API error (code ${data.errcode}): ${data.errmsg}\n  ${path}`);
-  }
-  return data;
-}
-
 // ─── URL / token parsing ─────────────────────────────────────────────
 
 function parseUrlOrToken(input) {
@@ -93,23 +128,26 @@ function parseUrlOrToken(input) {
   if (spaceMatch) return { spaceId: spaceMatch[1] };
 
   // Bare token
-  if (/^[A-Za-z0-9]+$/.test(input)) return { nodeId: input };
+  if (/^[A-Za-z0-9_-]+$/.test(input)) return { nodeId: input };
   fatal(`Cannot parse token from: ${input}`);
 }
 
-// ─── API wrappers ────────────────────────────────────────────────────
+// ─── API wrappers (v2.0 wiki) ───────────────────────────────────────
 
-async function listWorkspaces(unionId) {
+async function listWorkspaces() {
+  const operatorId = await getOperatorId();
   const items = [];
   let nextToken = undefined;
   do {
-    const body = { maxResults: 50 };
-    if (nextToken) body.nextToken = nextToken;
-    if (unionId) body.unionId = unionId;
-    const data = await api('/v1.0/doc/workspaces/query', {
-      method: 'POST',
-      body: JSON.stringify(body),
+    const params = new URLSearchParams({
+      maxResults: '50',
+      orderBy: 'VIEW_TIME_DESC',
+      withPermissionRole: 'false',
+      operatorId,
     });
+    if (nextToken) params.set('nextToken', nextToken);
+    const data = await api(`/v2.0/wiki/workspaces?${params}`);
+    if (data.workspaces) items.push(...data.workspaces);
     if (data.items) items.push(...data.items);
     nextToken = data.nextToken || undefined;
   } while (nextToken);
@@ -122,22 +160,27 @@ async function listWorkspaces(unionId) {
   for (const w of items) {
     console.log(`  ${w.name}`);
     console.log(`    ID: ${w.workspaceId}`);
+    if (w.rootNodeId) console.log(`    Root Node: ${w.rootNodeId}`);
     if (w.url) console.log(`    URL: ${w.url}`);
     console.log();
   }
 }
 
-async function listNodes(workspaceId, parentNodeId) {
+async function listNodes(parentNodeId) {
+  const operatorId = await getOperatorId();
   const items = [];
   let nextToken = undefined;
   do {
-    const params = new URLSearchParams({ maxResults: '50' });
-    if (parentNodeId) params.set('parentNodeId', parentNodeId);
+    const params = new URLSearchParams({
+      parentNodeId,
+      maxResults: '50',
+      withPermissionRole: 'false',
+      operatorId,
+    });
     if (nextToken) params.set('nextToken', nextToken);
-    const data = await api(
-      `/v1.0/doc/workspaces/${workspaceId}/nodes?${params}`,
-    );
+    const data = await api(`/v2.0/wiki/nodes?${params}`);
     if (data.nodes) items.push(...data.nodes);
+    if (data.items) items.push(...data.items);
     nextToken = data.nextToken || undefined;
   } while (nextToken);
 
@@ -145,58 +188,69 @@ async function listNodes(workspaceId, parentNodeId) {
     console.log('No nodes found.');
     return;
   }
-  const label = parentNodeId
-    ? `Child nodes of ${parentNodeId}`
-    : `Nodes in workspace ${workspaceId}`;
-  console.log(`${label}:\n`);
+  console.log(`Nodes under ${parentNodeId}:\n`);
   for (const n of items) {
-    const type = n.nodeType || 'unknown';
-    console.log(`  ${n.name} [${type}]`);
+    const category = n.category || n.type || 'unknown';
+    console.log(`  ${n.name} [${category}]`);
     console.log(`    Node ID: ${n.nodeId}`);
-    if (n.docKey) console.log(`    Doc key: ${n.docKey}`);
+    if (n.workspaceId) console.log(`    Workspace: ${n.workspaceId}`);
     if (n.hasChildren) console.log(`    Has children: yes`);
     if (n.url) console.log(`    URL: ${n.url}`);
     console.log();
   }
 }
 
-async function getNode(workspaceId, nodeId) {
-  const data = await api(
-    `/v1.0/doc/workspaces/${workspaceId}/nodes/${nodeId}`,
-  );
+async function getNode(nodeId) {
+  const operatorId = await getOperatorId();
+  const params = new URLSearchParams({
+    withPermissionRole: 'false',
+    operatorId,
+  });
+  const data = await api(`/v2.0/wiki/nodes/${nodeId}?${params}`);
   const n = data.node || data;
   console.log(`Node: ${n.name}`);
-  console.log(`  Type: ${n.nodeType}`);
+  if (n.category) console.log(`  Category: ${n.category}`);
+  if (n.type) console.log(`  Type: ${n.type}`);
   console.log(`  Node ID: ${n.nodeId}`);
-  if (n.docKey) console.log(`  Doc key: ${n.docKey}`);
   if (n.workspaceId) console.log(`  Workspace ID: ${n.workspaceId}`);
-  if (n.parentNodeId) console.log(`  Parent: ${n.parentNodeId}`);
   if (n.hasChildren) console.log(`  Has children: yes`);
   if (n.url) console.log(`  URL: ${n.url}`);
+  if (n.creatorId) console.log(`  Creator: ${n.creatorId}`);
+  if (n.modifiedTime) console.log(`  Modified: ${n.modifiedTime}`);
 }
 
-async function readDocument(workspaceId, nodeId) {
-  // Get node info to determine type
-  const nodeData = await api(
-    `/v1.0/doc/workspaces/${workspaceId}/nodes/${nodeId}`,
-  );
+async function readDocument(nodeId) {
+  // Get node info from v2.0 to determine type
+  const operatorId = await getOperatorId();
+  const params = new URLSearchParams({
+    withPermissionRole: 'false',
+    operatorId,
+  });
+  const nodeData = await api(`/v2.0/wiki/nodes/${nodeId}?${params}`);
   const node = nodeData.node || nodeData;
-  const docKey = node.docKey || nodeId;
-  const nodeType = node.nodeType || '';
+  const docKey = node.docKey || node.nodeId || nodeId;
+  const category = (node.category || '').toUpperCase();
 
-  if (nodeType === 'alidoc_sheet' || nodeType === 'sheet') {
+  // Non-ALIDOC files (PDF, Word, images, etc.) → download instead
+  if (NON_DOC_CATEGORIES.has(category)) {
+    console.log(`Node "${node.name}" is a file [${category}], downloading...`);
+    await downloadFile(nodeId, '.');
+    return;
+  }
+
+  if (category === 'ALIDOC_SHEET') {
     await readSheet(docKey);
     return;
   }
 
-  // Read document body blocks
+  // Read document body blocks via v1.0 doc API
   const blocks = [];
   let nextToken = undefined;
   do {
-    const params = new URLSearchParams({ maxResults: '100' });
-    if (nextToken) params.set('nextToken', nextToken);
+    const blockParams = new URLSearchParams({ maxResults: '100' });
+    if (nextToken) blockParams.set('nextToken', nextToken);
     const data = await api(
-      `/v1.0/doc/documents/${docKey}/blocks?${params}`,
+      `/v1.0/doc/documents/${docKey}/blocks?${blockParams}`,
     );
     if (data.children) blocks.push(...data.children);
     nextToken = data.nextToken || undefined;
@@ -309,7 +363,7 @@ function colToLetter(col) {
 }
 
 async function readSheet(docKey) {
-  // Get sheet metadata
+  // Get sheet metadata via v1.0 doc API
   const meta = await api(`/v1.0/doc/documents/${docKey}/sheets`);
   const sheets = meta.sheets || meta.items || [];
 
@@ -361,7 +415,78 @@ async function readSheet(docKey) {
   }
 }
 
-// ─── Search ──────────────────────────────────────────────────────────
+// ─── File download (v2.0 storage API) ────────────────────────────────
+
+const NON_DOC_CATEGORIES = new Set([
+  'DOCUMENT', 'IMAGE', 'VIDEO', 'AUDIO', 'ARCHIVE', 'OTHER',
+]);
+
+async function downloadFile(nodeId, outputDir) {
+  const operatorId = await getOperatorId();
+  const params = new URLSearchParams({
+    withPermissionRole: 'false',
+    operatorId,
+  });
+  const nodeData = await api(`/v2.0/wiki/nodes/${nodeId}?${params}`);
+  const node = nodeData.node || nodeData;
+  const category = node.category || '';
+  const fileName = node.name || `download-${nodeId}`;
+  const ext = node.extension ? `.${node.extension}` : '';
+  const fullName = ext && !fileName.endsWith(ext) ? fileName + ext : fileName;
+
+  // Bridge: convert wiki nodeId (dentryUuid) → storage spaceId + dentryId
+  // Wiki workspaceId != storage spaceId, so we must resolve via doc_2_0 API
+  const dentryInfo = await api(
+    `/v2.0/doc/dentries/${nodeId}/queryDentryId?operatorId=${operatorId}`,
+  );
+  const spaceId = dentryInfo.spaceId;
+  const dentryId = dentryInfo.dentryId;
+
+  if (!spaceId || !dentryId) {
+    fatal(`Cannot resolve storage IDs for node ${nodeId}:\n${JSON.stringify(dentryInfo, null, 2)}`);
+  }
+
+  // Get download info via v1.0 storage API (download only exists in storage_1_0)
+  const dlData = await api(
+    `/v1.0/storage/spaces/${spaceId}/dentries/${dentryId}/downloadInfos/query?unionId=${operatorId}`,
+    { method: 'POST', body: JSON.stringify({}) },
+  );
+
+  const sigInfo = dlData.headerSignatureInfo || {};
+  const resourceUrls = sigInfo.resourceUrls || [];
+  const resourceUrl = resourceUrls[0];
+  if (!resourceUrl) {
+    fatal(`No download URL returned for node ${nodeId}:\n${JSON.stringify(dlData, null, 2)}`);
+  }
+
+  // Build download headers from response
+  const dlHeaders = {};
+  if (sigInfo.headers) {
+    for (const [k, v] of Object.entries(sigInfo.headers)) {
+      dlHeaders[k] = v;
+    }
+  }
+
+  // Download the file
+  const dlRes = await fetch(resourceUrl, { headers: dlHeaders });
+  if (!dlRes.ok) {
+    fatal(`Download failed (${dlRes.status}): ${await dlRes.text()}`);
+  }
+
+  const fs = await import('fs');
+  const path = await import('path');
+  const destDir = outputDir || '.';
+  fs.mkdirSync(destDir, { recursive: true });
+  const destPath = path.join(destDir, fullName);
+  const buffer = Buffer.from(await dlRes.arrayBuffer());
+  fs.writeFileSync(destPath, buffer);
+
+  console.log(`Downloaded: ${destPath}`);
+  console.log(`  Size: ${buffer.length} bytes`);
+  console.log(`  Category: ${category}`);
+}
+
+// ─── Search (v1.0 doc API) ──────────────────────────────────────────
 
 async function searchDocs(keyword, workspaceId) {
   const body = { keyword, maxResults: 20 };
@@ -397,16 +522,18 @@ function fatal(msg) {
 function usage() {
   console.log(`Usage:
   dingtalk-wiki spaces                              List workspaces (knowledge bases)
-  dingtalk-wiki nodes <workspace_id>                List top-level nodes in a workspace
-  dingtalk-wiki nodes <workspace_id> -p <node_id>   List child nodes under a parent
-  dingtalk-wiki read <workspace_id> <url_or_node_id> Read document content as plain text
-  dingtalk-wiki node <workspace_id> <url_or_node_id> Get node info (type, title, IDs)
+  dingtalk-wiki nodes <parent_node_id>              List child nodes (use rootNodeId from spaces)
+  dingtalk-wiki read <url_or_node_id>               Read document/file (auto-detects type)
+  dingtalk-wiki download <url_or_node_id> [dir]     Download a file to dir (default: .)
+  dingtalk-wiki node <url_or_node_id>               Get node info (type, title, IDs)
   dingtalk-wiki search <keyword>                    Search documents by keyword
   dingtalk-wiki search <keyword> -w <workspace_id>  Search within a workspace
 
 Environment:
-  DINGTALK_APP_KEY      DingTalk app key (required)
-  DINGTALK_APP_SECRET   DingTalk app secret (required)`);
+  DINGTALK_APP_KEY       DingTalk app key (required)
+  DINGTALK_APP_SECRET    DingTalk app secret (required)
+
+Note: operatorId (unionId) is auto-resolved from the org's primary admin.`);
   process.exit(0);
 }
 
@@ -418,33 +545,38 @@ async function main() {
 
   switch (cmd) {
     case 'spaces':
-      await listWorkspaces(args[1]);
+      await listWorkspaces();
       break;
 
     case 'nodes': {
-      const workspaceId = args[1];
-      if (!workspaceId) fatal('Usage: dingtalk-wiki nodes <workspace_id> [-p <parent_node_id>]');
-      const pIdx = args.indexOf('-p');
-      const parentNodeId = pIdx !== -1 ? args[pIdx + 1] : undefined;
-      await listNodes(workspaceId, parentNodeId);
+      const parentNodeId = args[1];
+      if (!parentNodeId) fatal('Usage: dingtalk-wiki nodes <parent_node_id>\n  Use rootNodeId from "dingtalk-wiki spaces" output.');
+      await listNodes(parentNodeId);
       break;
     }
 
     case 'read': {
-      const workspaceId = args[1];
-      const input = args[2];
-      if (!workspaceId || !input) fatal('Usage: dingtalk-wiki read <workspace_id> <url_or_node_id>');
+      const input = args[1];
+      if (!input) fatal('Usage: dingtalk-wiki read <url_or_node_id>');
       const parsed = parseUrlOrToken(input);
-      await readDocument(workspaceId, parsed.nodeId || input);
+      await readDocument(parsed.nodeId || input);
+      break;
+    }
+
+    case 'download': {
+      const input = args[1];
+      if (!input) fatal('Usage: dingtalk-wiki download <url_or_node_id> [output_dir]');
+      const parsed = parseUrlOrToken(input);
+      const outputDir = args[2] || '.';
+      await downloadFile(parsed.nodeId || input, outputDir);
       break;
     }
 
     case 'node': {
-      const workspaceId = args[1];
-      const input = args[2];
-      if (!workspaceId || !input) fatal('Usage: dingtalk-wiki node <workspace_id> <url_or_node_id>');
+      const input = args[1];
+      if (!input) fatal('Usage: dingtalk-wiki node <url_or_node_id>');
       const parsed = parseUrlOrToken(input);
-      await getNode(workspaceId, parsed.nodeId || input);
+      await getNode(parsed.nodeId || input);
       break;
     }
 
