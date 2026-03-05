@@ -1,0 +1,23 @@
+skill: wecom
+version: 1.0.0
+description: "WeCom (企业微信) integration via wecom-relay WebSocket bridge. Bot + Agent dual-mode."
+core_version: 0.1.0
+adds:
+  - src/channels/wecom.ts
+modifies:
+  - src/index.ts
+  - src/config.ts
+  - src/container-runner.ts
+structured:
+  npm_dependencies:
+    ws: "^8.18.0"
+    "@types/ws": "^8.5.0"
+  env_additions:
+    - WECOM_RELAY_URL
+    - WECOM_CORP_ID
+    - WECOM_AGENT_ID
+    - WECOM_WS_TOKEN
+    - WECOM_BOT_WEBHOOK_URL
+conflicts: []
+depends: []
+test: "npm run build"
