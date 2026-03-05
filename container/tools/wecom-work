@@ -1,0 +1,346 @@
+#!/usr/bin/env node
+// wecom-work — CLI tool for WeCom (企业微信) schedule and todo management
+// Uses WeCom server API: https://qyapi.weixin.qq.com/cgi-bin/
+// No npm dependencies; uses built-in fetch (Node 18+)
+
+const WECOM_CORP_ID = process.env.WECOM_CORP_ID;
+const WECOM_AGENT_SECRET = process.env.WECOM_AGENT_SECRET;
+
+const BASE = 'https://qyapi.weixin.qq.com/cgi-bin';
+
+// ─── Auth ────────────────────────────────────────────────────────────
+
+let _tokenCache = null;
+
+async function getAccessToken() {
+  if (_tokenCache && Date.now() < _tokenCache.expiresAt) {
+    return _tokenCache.token;
+  }
+  if (!WECOM_CORP_ID || !WECOM_AGENT_SECRET) {
+    fatal('WECOM_CORP_ID and WECOM_AGENT_SECRET must be set');
+  }
+  const url = `${BASE}/gettoken?corpid=${WECOM_CORP_ID}&corpsecret=${WECOM_AGENT_SECRET}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.errcode) {
+    fatal(`Auth failed (${data.errcode}): ${data.errmsg}`);
+  }
+  _tokenCache = {
+    token: data.access_token,
+    expiresAt: Date.now() + (data.expires_in - 60) * 1000,
+  };
+  return _tokenCache.token;
+}
+
+// ─── HTTP helpers ────────────────────────────────────────────────────
+
+async function api(path, opts = {}) {
+  const token = await getAccessToken();
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `${BASE}${path}${sep}access_token=${token}`;
+  const res = await fetch(url, {
+    method: opts.method || (opts.body ? 'POST' : 'GET'),
+    headers: { 'Content-Type': 'application/json', ...opts.headers },
+    body: opts.body ? (typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body)) : undefined,
+  });
+  const data = await res.json();
+  if (data.errcode) {
+    fatal(`API error (${data.errcode}): ${data.errmsg}\n  ${path}`);
+  }
+  return data;
+}
+
+// ─── Schedule: List events ───────────────────────────────────────────
+
+async function calendarList(dateStr) {
+  const date = dateStr ? new Date(dateStr) : new Date();
+  const dayStart = new Date(date);
+  dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(date);
+  dayEnd.setHours(23, 59, 59, 999);
+
+  // Collect calendar IDs — try fetching user's calendars, fall back to empty list
+  let calIds = [];
+  try {
+    const calData = await api('/oa/calendar/get', {
+      body: { cal_id_list: [] },
+    });
+    calIds = (calData.calendar_list || []).map((c) => c.cal_id).filter(Boolean);
+  } catch { /* no calendars accessible */ }
+
+  // Fetch schedules from all calendars (or default if none found)
+  let events = [];
+  const idsToQuery = calIds.length ? calIds : ['default'];
+  try {
+    const data = await api('/oa/schedule/get_by_calendar', {
+      body: { cal_id_list: idsToQuery, offset: 0, limit: 100 },
+    });
+    events = data.schedule_list || [];
+  } catch {
+    console.log('No calendar events found. Use "wecom-work cal create" to create events.');
+    return;
+  }
+
+  // Filter to the requested day
+  const dayEvents = events.filter((e) => {
+    const start = e.start_time ? e.start_time * 1000 : 0;
+    return start >= dayStart.getTime() && start <= dayEnd.getTime();
+  });
+
+  if (!dayEvents.length) {
+    console.log(`No events on ${dayStart.toLocaleDateString()}.`);
+    return;
+  }
+
+  console.log(`Events on ${dayStart.toLocaleDateString()}:\n`);
+  for (const e of dayEvents) {
+    const start = e.start_time ? new Date(e.start_time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '?';
+    const end = e.end_time ? new Date(e.end_time * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '?';
+    console.log(`  ${e.summary || '(no title)'}`);
+    console.log(`    ID: ${e.schedule_id}`);
+    console.log(`    Time: ${start} - ${end}`);
+    if (e.location) console.log(`    Location: ${e.location}`);
+    if (e.description) console.log(`    Note: ${e.description.slice(0, 100)}`);
+    if (e.attendees?.length) {
+      const names = e.attendees.map((a) => a.userid).join(', ');
+      console.log(`    Attendees: ${names}`);
+    }
+    console.log();
+  }
+}
+
+// ─── Schedule: Create event ──────────────────────────────────────────
+
+async function calendarCreate(summary, startStr, endStr, opts = {}) {
+  const startTime = Math.floor(new Date(startStr).getTime() / 1000);
+  const endTime = Math.floor(new Date(endStr).getTime() / 1000);
+
+  const schedule = {
+    summary,
+    start_time: startTime,
+    end_time: endTime,
+  };
+  if (opts.location) schedule.location = opts.location;
+  if (opts.description) schedule.description = opts.description;
+  if (opts.attendees) {
+    schedule.attendees = opts.attendees.split(',').map((u) => ({ userid: u.trim() }));
+  }
+
+  // Reminders: default 15 min before
+  schedule.reminders = { remind_before: [900] };
+
+  const data = await api('/oa/schedule/add', {
+    body: { schedule },
+  });
+
+  console.log(`Created event: ${summary}`);
+  if (data.schedule_id) console.log(`  ID: ${data.schedule_id}`);
+  console.log(`  Start: ${new Date(startTime * 1000).toLocaleString()}`);
+  console.log(`  End: ${new Date(endTime * 1000).toLocaleString()}`);
+}
+
+// ─── Schedule: Update event ──────────────────────────────────────────
+
+async function calendarUpdate(scheduleId, opts = {}) {
+  const schedule = { schedule_id: scheduleId };
+  if (opts.summary) schedule.summary = opts.summary;
+  if (opts.start) schedule.start_time = Math.floor(new Date(opts.start).getTime() / 1000);
+  if (opts.end) schedule.end_time = Math.floor(new Date(opts.end).getTime() / 1000);
+  if (opts.location) schedule.location = opts.location;
+  if (opts.description) schedule.description = opts.description;
+
+  await api('/oa/schedule/update', {
+    body: { schedule },
+  });
+  console.log(`Updated event: ${scheduleId}`);
+}
+
+// ─── Schedule: Delete event ──────────────────────────────────────────
+
+async function calendarDelete(scheduleId) {
+  await api('/oa/schedule/del', {
+    body: { schedule_id: scheduleId },
+  });
+  console.log(`Deleted event: ${scheduleId}`);
+}
+
+// ─── Schedule: Get event ─────────────────────────────────────────────
+
+async function calendarGet(scheduleId) {
+  const data = await api('/oa/schedule/get', {
+    body: { schedule_id_list: [scheduleId] },
+  });
+  const events = data.schedule_list || [];
+  if (!events.length) {
+    console.log(`Event not found: ${scheduleId}`);
+    return;
+  }
+  const e = events[0];
+  const start = e.start_time ? new Date(e.start_time * 1000).toLocaleString() : '?';
+  const end = e.end_time ? new Date(e.end_time * 1000).toLocaleString() : '?';
+  console.log(`Event: ${e.summary || '(no title)'}`);
+  console.log(`  ID: ${e.schedule_id}`);
+  console.log(`  Time: ${start} - ${end}`);
+  if (e.location) console.log(`  Location: ${e.location}`);
+  if (e.description) console.log(`  Note: ${e.description}`);
+  if (e.attendees?.length) {
+    const names = e.attendees.map((a) => a.userid).join(', ');
+    console.log(`  Attendees: ${names}`);
+  }
+}
+
+// ─── Todo: Create ────────────────────────────────────────────────────
+
+async function todoCreate(title, opts = {}) {
+  const body = {
+    title,
+    creator: opts.creator || undefined,
+  };
+  if (opts.description) body.description = opts.description;
+  if (opts.due) {
+    body.due_date = Math.floor(new Date(opts.due).getTime() / 1000);
+  }
+
+  const data = await api('/wedoc/create_doc', {
+    body: { doctype: 10, ...body },
+  }).catch(() => null);
+
+  // WeCom doesn't have a standalone todo API like DingTalk.
+  // Use the living-doc task list or OA approval as workaround.
+  // For now, create a simple schedule-based reminder as a "todo".
+  if (!data) {
+    // Fallback: create a schedule event as a todo item
+    const now = new Date();
+    const dueDate = opts.due ? new Date(opts.due) : new Date(now.getTime() + 24 * 60 * 60 * 1000);
+    const schedule = {
+      summary: `[TODO] ${title}`,
+      start_time: Math.floor(dueDate.getTime() / 1000),
+      end_time: Math.floor(dueDate.getTime() / 1000) + 1800, // 30 min
+      description: opts.description || '',
+      reminders: { remind_before: [900] },
+    };
+    const result = await api('/oa/schedule/add', { body: { schedule } });
+    console.log(`Created todo (as schedule): ${title}`);
+    if (result.schedule_id) console.log(`  ID: ${result.schedule_id}`);
+    console.log(`  Due: ${dueDate.toLocaleString()}`);
+    if (opts.description) console.log(`  Note: ${opts.description}`);
+    return;
+  }
+
+  console.log(`Created todo: ${title}`);
+}
+
+// ─── CLI ─────────────────────────────────────────────────────────────
+
+function fatal(msg) {
+  console.error(`Error: ${msg}`);
+  process.exit(1);
+}
+
+function parseOpts(args, flags) {
+  const opts = {};
+  for (const flag of flags) {
+    const idx = args.indexOf(`--${flag}`);
+    if (idx !== -1 && idx + 1 < args.length) {
+      opts[flag] = args[idx + 1];
+    }
+  }
+  return opts;
+}
+
+function usage() {
+  console.log(`Usage:
+  Calendar:
+    wecom-work cal list [date]                             List events (default: today)
+    wecom-work cal get <schedule_id>                       Get event details
+    wecom-work cal create <summary> <start> <end> [--location <loc>] [--description <text>] [--attendees <user1,user2>]
+    wecom-work cal update <schedule_id> [--summary <s>] [--start <t>] [--end <t>] [--location <loc>] [--description <text>]
+    wecom-work cal delete <schedule_id>                    Delete an event
+
+  Todo (creates schedule-based reminders):
+    wecom-work todo create <title> [--due <date>] [--description <text>]
+
+  Date formats: "2025-03-15", "2025-03-15T14:00", ISO 8601
+
+Environment:
+  WECOM_CORP_ID          WeCom corp ID (required)
+  WECOM_AGENT_SECRET     WeCom agent secret (required)`);
+  process.exit(0);
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (!args.length) usage();
+
+  const domain = args[0];
+  const cmd = args[1];
+
+  switch (domain) {
+    case 'cal': {
+      switch (cmd) {
+        case 'list':
+          await calendarList(args[2]);
+          break;
+        case 'get': {
+          const id = args[2];
+          if (!id) fatal('Usage: wecom-work cal get <schedule_id>');
+          await calendarGet(id);
+          break;
+        }
+        case 'create': {
+          const summary = args[2];
+          const start = args[3];
+          const end = args[4];
+          if (!summary || !start || !end) fatal('Usage: wecom-work cal create <summary> <start> <end> [--location <loc>]');
+          const opts = parseOpts(args, ['location', 'description', 'attendees']);
+          await calendarCreate(summary, start, end, opts);
+          break;
+        }
+        case 'update': {
+          const id = args[2];
+          if (!id) fatal('Usage: wecom-work cal update <schedule_id> [--summary <s>] [--start <t>] [--end <t>]');
+          const opts = parseOpts(args, ['summary', 'start', 'end', 'location', 'description']);
+          await calendarUpdate(id, opts);
+          break;
+        }
+        case 'delete': {
+          const id = args[2];
+          if (!id) fatal('Usage: wecom-work cal delete <schedule_id>');
+          await calendarDelete(id);
+          break;
+        }
+        default:
+          fatal(`Unknown cal command: ${cmd}\nRun "wecom-work help" for usage.`);
+      }
+      break;
+    }
+
+    case 'todo': {
+      switch (cmd) {
+        case 'create': {
+          const title = args[2];
+          if (!title) fatal('Usage: wecom-work todo create <title> [--due <date>] [--description <text>]');
+          const opts = parseOpts(args, ['due', 'description']);
+          await todoCreate(title, opts);
+          break;
+        }
+        default:
+          fatal(`Unknown todo command: ${cmd}\nRun "wecom-work help" for usage.`);
+      }
+      break;
+    }
+
+    case 'help':
+    case '--help':
+    case '-h':
+      usage();
+      break;
+
+    default:
+      fatal(`Unknown domain: ${domain}\nRun "wecom-work help" for usage.`);
+  }
+}
+
+main().catch((err) => {
+  fatal(err.message || String(err));
+});

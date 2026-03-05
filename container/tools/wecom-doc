@@ -1,0 +1,409 @@
+#!/usr/bin/env node
+// wecom-doc — CLI tool to manage WeCom (企业微信) Wedrive files and spaces
+// Uses WeCom server API: https://qyapi.weixin.qq.com/cgi-bin/
+// No npm dependencies; uses built-in fetch (Node 18+)
+
+const WECOM_CORP_ID = process.env.WECOM_CORP_ID;
+const WECOM_AGENT_SECRET = process.env.WECOM_AGENT_SECRET;
+
+const BASE = 'https://qyapi.weixin.qq.com/cgi-bin';
+
+// ─── Auth ────────────────────────────────────────────────────────────
+
+let _tokenCache = null;
+
+async function getAccessToken() {
+  if (_tokenCache && Date.now() < _tokenCache.expiresAt) {
+    return _tokenCache.token;
+  }
+  if (!WECOM_CORP_ID || !WECOM_AGENT_SECRET) {
+    fatal('WECOM_CORP_ID and WECOM_AGENT_SECRET must be set');
+  }
+  const url = `${BASE}/gettoken?corpid=${WECOM_CORP_ID}&corpsecret=${WECOM_AGENT_SECRET}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (data.errcode) {
+    fatal(`Auth failed (${data.errcode}): ${data.errmsg}`);
+  }
+  _tokenCache = {
+    token: data.access_token,
+    expiresAt: Date.now() + (data.expires_in - 60) * 1000,
+  };
+  return _tokenCache.token;
+}
+
+// ─── HTTP helpers ────────────────────────────────────────────────────
+
+async function api(path, opts = {}) {
+  const token = await getAccessToken();
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `${BASE}${path}${sep}access_token=${token}`;
+  const res = await fetch(url, {
+    method: opts.method || (opts.body ? 'POST' : 'GET'),
+    headers: { 'Content-Type': 'application/json', ...opts.headers },
+    body: opts.body ? (typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body)) : undefined,
+  });
+  const data = await res.json();
+  if (data.errcode) {
+    fatal(`API error (${data.errcode}): ${data.errmsg}\n  ${path}`);
+  }
+  return data;
+}
+
+async function apiRaw(path, opts = {}) {
+  const token = await getAccessToken();
+  const sep = path.includes('?') ? '&' : '?';
+  const url = `${BASE}${path}${sep}access_token=${token}`;
+  return fetch(url, {
+    method: opts.method || (opts.body ? 'POST' : 'GET'),
+    headers: opts.headers || {},
+    body: opts.body,
+  });
+}
+
+// ─── Wedrive: List spaces ────────────────────────────────────────────
+
+async function listSpaces() {
+  const data = await api('/wedrive/space_list', {
+    body: { limit: 100 },
+  });
+  const spaces = data.space_list || [];
+  if (!spaces.length) {
+    console.log('No Wedrive spaces found.');
+    return;
+  }
+  console.log('Wedrive spaces:\n');
+  for (const s of spaces) {
+    console.log(`  ${s.space_name}`);
+    console.log(`    Space ID: ${s.spaceid}`);
+    if (s.space_sub_type !== undefined) console.log(`    Type: ${s.space_sub_type === 0 ? 'personal' : 'shared'}`);
+    if (s.auth_list) {
+      const perms = [];
+      if (s.auth_list.auth_info) {
+        for (const a of s.auth_list.auth_info) {
+          if (a.userid) perms.push(a.userid);
+          if (a.departmentid) perms.push(`dept:${a.departmentid}`);
+        }
+      }
+      if (perms.length) console.log(`    Members: ${perms.join(', ')}`);
+    }
+    console.log();
+  }
+}
+
+// ─── Wedrive: List files ─────────────────────────────────────────────
+
+async function listFiles(spaceId, folderId) {
+  const body = { spaceid: spaceId, limit: 100, sort_type: 2 };
+  if (folderId) body.fatherid = folderId;
+  const data = await api('/wedrive/file_list', { body });
+  const files = data.file_list?.item || [];
+  if (!files.length) {
+    console.log('No files found.');
+    return;
+  }
+  const parent = folderId || '(root)';
+  console.log(`Files in ${parent}:\n`);
+  for (const f of files) {
+    const type = f.file_type === 1 ? 'folder' : fileTypeName(f.file_type);
+    const size = f.file_size ? ` (${formatSize(f.file_size)})` : '';
+    console.log(`  ${f.file_name} [${type}]${size}`);
+    console.log(`    File ID: ${f.fileid}`);
+    if (f.ctime) console.log(`    Created: ${new Date(f.ctime * 1000).toLocaleString()}`);
+    if (f.mtime) console.log(`    Modified: ${new Date(f.mtime * 1000).toLocaleString()}`);
+    console.log();
+  }
+}
+
+function fileTypeName(t) {
+  const map = { 1: 'folder', 3: 'file', 4: 'micro-doc', 5: 'spreadsheet', 6: 'slide', 7: 'form', 8: 'flowchart', 9: 'mind-map' };
+  return map[t] || `type-${t}`;
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(1)}GB`;
+}
+
+// ─── Wedrive: File info ──────────────────────────────────────────────
+
+async function fileInfo(fileId) {
+  const data = await api('/wedrive/file_info', {
+    body: { fileid: fileId },
+  });
+  const f = data.file_info || data;
+  console.log(`File: ${f.file_name}`);
+  console.log(`  File ID: ${f.fileid}`);
+  console.log(`  Type: ${fileTypeName(f.file_type)}`);
+  if (f.file_size) console.log(`  Size: ${formatSize(f.file_size)}`);
+  if (f.spaceid) console.log(`  Space ID: ${f.spaceid}`);
+  if (f.fatherid) console.log(`  Parent: ${f.fatherid}`);
+  if (f.ctime) console.log(`  Created: ${new Date(f.ctime * 1000).toLocaleString()}`);
+  if (f.mtime) console.log(`  Modified: ${new Date(f.mtime * 1000).toLocaleString()}`);
+  if (f.url) console.log(`  URL: ${f.url}`);
+}
+
+// ─── Wedrive: Create folder ──────────────────────────────────────────
+
+async function createFolder(spaceId, folderId, name) {
+  const data = await api('/wedrive/file_create', {
+    body: { spaceid: spaceId, fatherid: folderId, file_type: 1, file_name: name },
+  });
+  console.log(`Created folder: ${name}`);
+  if (data.fileid) console.log(`  File ID: ${data.fileid}`);
+}
+
+// ─── Wedrive: Create document ────────────────────────────────────────
+
+async function createDoc(spaceId, folderId, name, type) {
+  // file_type: 4=micro-doc, 5=spreadsheet, 6=slide
+  const typeMap = { doc: 4, sheet: 5, slide: 6, form: 7, flowchart: 8, mindmap: 9 };
+  const fileType = typeMap[type] || 4;
+  const data = await api('/wedrive/file_create', {
+    body: { spaceid: spaceId, fatherid: folderId, file_type: fileType, file_name: name },
+  });
+  console.log(`Created ${type || 'doc'}: ${name}`);
+  if (data.fileid) console.log(`  File ID: ${data.fileid}`);
+  if (data.url) console.log(`  URL: ${data.url}`);
+}
+
+// ─── Wedrive: Download file ──────────────────────────────────────────
+
+async function downloadFile(fileId, outputDir) {
+  // Get download URL
+  const data = await api('/wedrive/file_download', {
+    body: { fileid: fileId },
+  });
+  const downloadUrl = data.download_url;
+  if (!downloadUrl) {
+    fatal(`No download URL returned for file ${fileId}`);
+  }
+
+  // Get file info for name
+  let fileName = `download-${fileId}`;
+  try {
+    const info = await api('/wedrive/file_info', { body: { fileid: fileId } });
+    if (info.file_info?.file_name) fileName = info.file_info.file_name;
+  } catch { /* use default name */ }
+
+  // Download
+  const dlRes = await fetch(downloadUrl);
+  if (!dlRes.ok) {
+    fatal(`Download failed (${dlRes.status})`);
+  }
+
+  const fs = await import('fs');
+  const path = await import('path');
+  const destDir = outputDir || '.';
+  fs.mkdirSync(destDir, { recursive: true });
+  const destPath = path.join(destDir, fileName);
+  const buffer = Buffer.from(await dlRes.arrayBuffer());
+  fs.writeFileSync(destPath, buffer);
+
+  console.log(`Downloaded: ${destPath}`);
+  console.log(`  Size: ${formatSize(buffer.length)}`);
+}
+
+// ─── Wedrive: Upload file ────────────────────────────────────────────
+
+async function uploadFile(spaceId, folderId, filePath) {
+  const fs = await import('fs');
+  const path = await import('path');
+
+  if (!fs.existsSync(filePath)) {
+    fatal(`File not found: ${filePath}`);
+  }
+
+  const fileName = path.basename(filePath);
+  const fileSize = fs.statSync(filePath).size;
+
+  // Step 1: Create upload session
+  const session = await api('/wedrive/file_upload_init', {
+    body: {
+      spaceid: spaceId,
+      fatherid: folderId,
+      file_name: fileName,
+      size: fileSize,
+    },
+  });
+
+  const uploadKey = session.upload_key;
+  if (!uploadKey) {
+    fatal(`No upload_key returned:\n${JSON.stringify(session, null, 2)}`);
+  }
+
+  // Step 2: Upload file content (single-part for simplicity)
+  const fileBuffer = fs.readFileSync(filePath);
+  const token = await getAccessToken();
+  const formData = new FormData();
+  formData.append('file_content', new Blob([fileBuffer]), fileName);
+  formData.append('upload_key', uploadKey);
+  formData.append('index', '1');
+
+  const uploadRes = await fetch(
+    `${BASE}/wedrive/file_upload_part?access_token=${token}`,
+    { method: 'POST', body: formData },
+  );
+  const uploadData = await uploadRes.json();
+  if (uploadData.errcode) {
+    fatal(`Upload part failed (${uploadData.errcode}): ${uploadData.errmsg}`);
+  }
+
+  // Step 3: Finish upload
+  const finish = await api('/wedrive/file_upload_finish', {
+    body: { upload_key: uploadKey },
+  });
+
+  console.log(`Uploaded: ${fileName}`);
+  console.log(`  Size: ${formatSize(fileSize)}`);
+  if (finish.fileid) console.log(`  File ID: ${finish.fileid}`);
+}
+
+// ─── Wedrive: Delete file ────────────────────────────────────────────
+
+async function deleteFile(fileId) {
+  await api('/wedrive/file_delete', {
+    body: { fileid: [fileId] },
+  });
+  console.log(`Deleted file: ${fileId}`);
+}
+
+// ─── Wedrive: Search ─────────────────────────────────────────────────
+
+async function searchFiles(keyword, spaceId) {
+  const body = { keyword, limit: 20 };
+  if (spaceId) body.spaceid = spaceId;
+  const data = await api('/wedrive/file_search', { body });
+  const files = data.file_list?.item || [];
+  if (!files.length) {
+    console.log(`No files found for "${keyword}".`);
+    return;
+  }
+  console.log(`Search results for "${keyword}":\n`);
+  for (const f of files) {
+    const type = fileTypeName(f.file_type);
+    console.log(`  ${f.file_name} [${type}]`);
+    console.log(`    File ID: ${f.fileid}`);
+    if (f.spaceid) console.log(`    Space: ${f.spaceid}`);
+    if (f.url) console.log(`    URL: ${f.url}`);
+    console.log();
+  }
+}
+
+// ─── CLI ─────────────────────────────────────────────────────────────
+
+function fatal(msg) {
+  console.error(`Error: ${msg}`);
+  process.exit(1);
+}
+
+function usage() {
+  console.log(`Usage:
+  wecom-doc spaces                                    List Wedrive spaces
+  wecom-doc files <space_id> [folder_id]              List files in a space/folder
+  wecom-doc info <file_id>                            Get file info
+  wecom-doc download <file_id> [output_dir]           Download a file
+  wecom-doc upload <space_id> <folder_id> <file>      Upload a file
+  wecom-doc mkdir <space_id> <folder_id> <name>       Create a folder
+  wecom-doc create <space_id> <folder_id> <name> [type]  Create a document (doc|sheet|slide|form|flowchart|mindmap)
+  wecom-doc delete <file_id>                          Delete a file
+  wecom-doc search <keyword> [-s <space_id>]          Search files
+
+Environment:
+  WECOM_CORP_ID          WeCom corp ID (required)
+  WECOM_AGENT_SECRET     WeCom agent secret (required)`);
+  process.exit(0);
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (!args.length) usage();
+
+  const cmd = args[0];
+
+  switch (cmd) {
+    case 'spaces':
+      await listSpaces();
+      break;
+
+    case 'files': {
+      const spaceId = args[1];
+      if (!spaceId) fatal('Usage: wecom-doc files <space_id> [folder_id]');
+      await listFiles(spaceId, args[2]);
+      break;
+    }
+
+    case 'info': {
+      const fileId = args[1];
+      if (!fileId) fatal('Usage: wecom-doc info <file_id>');
+      await fileInfo(fileId);
+      break;
+    }
+
+    case 'download': {
+      const fileId = args[1];
+      if (!fileId) fatal('Usage: wecom-doc download <file_id> [output_dir]');
+      await downloadFile(fileId, args[2]);
+      break;
+    }
+
+    case 'upload': {
+      const spaceId = args[1];
+      const folderId = args[2];
+      const file = args[3];
+      if (!spaceId || !folderId || !file) fatal('Usage: wecom-doc upload <space_id> <folder_id> <file_path>');
+      await uploadFile(spaceId, folderId, file);
+      break;
+    }
+
+    case 'mkdir': {
+      const spaceId = args[1];
+      const folderId = args[2];
+      const name = args[3];
+      if (!spaceId || !folderId || !name) fatal('Usage: wecom-doc mkdir <space_id> <folder_id> <name>');
+      await createFolder(spaceId, folderId, name);
+      break;
+    }
+
+    case 'create': {
+      const spaceId = args[1];
+      const folderId = args[2];
+      const name = args[3];
+      const type = args[4] || 'doc';
+      if (!spaceId || !folderId || !name) fatal('Usage: wecom-doc create <space_id> <folder_id> <name> [type]');
+      await createDoc(spaceId, folderId, name, type);
+      break;
+    }
+
+    case 'delete': {
+      const fileId = args[1];
+      if (!fileId) fatal('Usage: wecom-doc delete <file_id>');
+      await deleteFile(fileId);
+      break;
+    }
+
+    case 'search': {
+      const keyword = args[1];
+      if (!keyword) fatal('Usage: wecom-doc search <keyword> [-s <space_id>]');
+      const sIdx = args.indexOf('-s');
+      const spaceId = sIdx !== -1 ? args[sIdx + 1] : undefined;
+      await searchFiles(keyword, spaceId);
+      break;
+    }
+
+    case 'help':
+    case '--help':
+    case '-h':
+      usage();
+      break;
+
+    default:
+      fatal(`Unknown command: ${cmd}\nRun "wecom-doc help" for usage.`);
+  }
+}
+
+main().catch((err) => {
+  fatal(err.message || String(err));
+});

@@ -37,6 +37,8 @@ const SKILL_REQUIRED_ENV: Record<string, string[]> = {
   'feishu-wiki': ['FEISHU_APP_ID', 'FEISHU_APP_SECRET'],
   'dingtalk-wiki': ['DINGTALK_APP_KEY', 'DINGTALK_APP_SECRET'],
   'dingtalk-work': ['DINGTALK_APP_KEY', 'DINGTALK_APP_SECRET'],
+  'wecom-doc': ['WECOM_CORP_ID', 'WECOM_AGENT_SECRET'],
+  'wecom-work': ['WECOM_CORP_ID', 'WECOM_AGENT_SECRET'],
 };
 
 export interface MediaAttachment {
@@ -238,6 +240,7 @@ function readSecrets(): Record<string, string> {
     'WECOM_WS_TOKEN',
     'WECOM_BOT_WEBHOOK_URL',
     'WECOM_BOT_WEBHOOK_JID',
+    'WECOM_AGENT_SECRET',
   ]);
 }
 
