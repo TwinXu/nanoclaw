@@ -1,0 +1,414 @@
+#!/usr/bin/env node
+// dingtalk-work — CLI tool for DingTalk todo and calendar management
+// Uses v1.0 todo API and v1.0 calendar API
+// No npm dependencies; uses built-in fetch (Node 18+)
+
+const DINGTALK_APP_KEY = process.env.DINGTALK_APP_KEY;
+const DINGTALK_APP_SECRET = process.env.DINGTALK_APP_SECRET;
+
+const BASE = 'https://api.dingtalk.com';
+const OAPI_BASE = 'https://oapi.dingtalk.com';
+
+// ─── Auth ────────────────────────────────────────────────────────────
+
+let _tokenCache = null;
+
+async function getAccessToken() {
+  if (_tokenCache && Date.now() < _tokenCache.expiresAt) {
+    return _tokenCache.token;
+  }
+  if (!DINGTALK_APP_KEY || !DINGTALK_APP_SECRET) {
+    fatal('DINGTALK_APP_KEY and DINGTALK_APP_SECRET must be set');
+  }
+  const res = await fetch(`${BASE}/v1.0/oauth2/accessToken`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      appKey: DINGTALK_APP_KEY,
+      appSecret: DINGTALK_APP_SECRET,
+    }),
+  });
+  const data = await res.json();
+  if (!data.accessToken) {
+    fatal(`Auth failed: ${JSON.stringify(data)}`);
+  }
+  _tokenCache = {
+    token: data.accessToken,
+    expiresAt: Date.now() + (data.expireIn - 60) * 1000,
+  };
+  return _tokenCache.token;
+}
+
+// ─── Operator ID (auto-resolve from admin) ──────────────────────────
+
+let _operatorCache = null;
+
+async function getOperator() {
+  if (_operatorCache) return _operatorCache;
+
+  const token = await getAccessToken();
+
+  const adminRes = await fetch(
+    `${OAPI_BASE}/topapi/user/listadmin?access_token=${token}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    },
+  );
+  const adminData = await adminRes.json();
+  if (adminData.errcode && adminData.errcode !== 0) {
+    fatal(`Failed to get admin list: ${adminData.errmsg}`);
+  }
+  const admins = adminData.result || [];
+  const admin = admins.find((a) => a.sys_level === 1) || admins[0];
+  if (!admin) {
+    fatal('No admin found in organization');
+  }
+
+  const userRes = await fetch(
+    `${OAPI_BASE}/topapi/v2/user/get?access_token=${token}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ userid: admin.userid }),
+    },
+  );
+  const userData = await userRes.json();
+  if (userData.errcode && userData.errcode !== 0) {
+    fatal(`Failed to get user detail: ${userData.errmsg}`);
+  }
+
+  _operatorCache = {
+    unionId: userData.result?.unionid,
+    userId: admin.userid,
+  };
+  if (!_operatorCache.unionId) {
+    fatal(`No unionId found for admin user ${admin.userid}`);
+  }
+  return _operatorCache;
+}
+
+// ─── HTTP helpers ────────────────────────────────────────────────────
+
+async function api(path, opts = {}) {
+  const token = await getAccessToken();
+  const url = path.startsWith('http') ? path : `${BASE}${path}`;
+  const res = await fetch(url, {
+    ...opts,
+    headers: {
+      'x-acs-dingtalk-access-token': token,
+      'Content-Type': 'application/json',
+      ...opts.headers,
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    fatal(`API error (${res.status}): ${text}\n  ${path}`);
+  }
+  return res.json();
+}
+
+// ─── Todo: List ──────────────────────────────────────────────────────
+
+async function todoList(done) {
+  const { unionId } = await getOperator();
+  const items = [];
+  let nextToken = undefined;
+  do {
+    const body = { maxResults: 50, isDone: !!done };
+    if (nextToken) body.nextToken = nextToken;
+    const data = await api(
+      `/v1.0/todo/users/${unionId}/tasks/query`,
+      { method: 'POST', body: JSON.stringify(body) },
+    );
+    if (data.todoCards) items.push(...data.todoCards);
+    nextToken = data.nextToken || undefined;
+  } while (nextToken);
+
+  if (!items.length) {
+    console.log(done ? 'No completed todos.' : 'No pending todos.');
+    return;
+  }
+  console.log(done ? 'Completed todos:\n' : 'Pending todos:\n');
+  for (const t of items) {
+    const due = t.dueTime ? new Date(t.dueTime).toLocaleString() : '';
+    const prio = t.priority ? `${t.priority}` : '';
+    console.log(`  ${t.subject}`);
+    console.log(`    ID: ${t.taskId}`);
+    if (due) console.log(`    Due: ${due}`);
+    if (prio) console.log(`    Priority: ${prio}`);
+    if (t.description) console.log(`    Note: ${t.description.slice(0, 100)}`);
+    console.log();
+  }
+}
+
+// ─── Todo: Create ────────────────────────────────────────────────────
+
+async function todoCreate(subject, opts = {}) {
+  const { unionId } = await getOperator();
+  const body = {
+    subject,
+    creatorId: unionId,
+    executorIds: [unionId],
+  };
+  if (opts.due) {
+    body.dueTime = new Date(opts.due).getTime();
+  }
+  if (opts.description) {
+    body.description = opts.description;
+  }
+  if (opts.priority) {
+    // DingTalk priority: 10=low, 20=normal, 30=important, 40=urgent
+    const map = { low: 10, normal: 20, important: 30, urgent: 40 };
+    body.priority = map[opts.priority] || parseInt(opts.priority) || 20;
+  }
+
+  const data = await api(
+    `/v1.0/todo/users/${unionId}/tasks`,
+    { method: 'POST', body: JSON.stringify(body) },
+  );
+  console.log(`Created todo: ${subject}`);
+  if (data.id || data.taskId) console.log(`  ID: ${data.id || data.taskId}`);
+  if (body.dueTime) console.log(`  Due: ${new Date(body.dueTime).toLocaleString()}`);
+}
+
+// ─── Todo: Complete ──────────────────────────────────────────────────
+
+async function todoComplete(taskId) {
+  const { unionId } = await getOperator();
+  await api(
+    `/v1.0/todo/users/${unionId}/tasks/${taskId}`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ done: true }),
+    },
+  );
+  console.log(`Completed todo: ${taskId}`);
+}
+
+// ─── Todo: Delete ────────────────────────────────────────────────────
+
+async function todoDelete(taskId) {
+  const { unionId } = await getOperator();
+  await api(
+    `/v1.0/todo/users/${unionId}/tasks/${taskId}`,
+    { method: 'DELETE' },
+  );
+  console.log(`Deleted todo: ${taskId}`);
+}
+
+// ─── Calendar: List events ───────────────────────────────────────────
+
+async function calendarList(dateStr) {
+  const { unionId } = await getOperator();
+
+  // Default to today
+  const date = dateStr ? new Date(dateStr) : new Date();
+  const dayStart = new Date(date);
+  dayStart.setHours(0, 0, 0, 0);
+  const dayEnd = new Date(date);
+  dayEnd.setHours(23, 59, 59, 999);
+
+  const calendarId = 'primary';
+  const params = new URLSearchParams({
+    timeMin: dayStart.toISOString(),
+    timeMax: dayEnd.toISOString(),
+    maxResults: '50',
+  });
+
+  const data = await api(
+    `/v1.0/calendar/users/${unionId}/calendars/${calendarId}/events?${params}`,
+  );
+  const events = data.events || data.items || [];
+
+  if (!events.length) {
+    console.log(`No events on ${dayStart.toLocaleDateString()}.`);
+    return;
+  }
+
+  console.log(`Events on ${dayStart.toLocaleDateString()}:\n`);
+  for (const e of events) {
+    const start = e.start?.dateTime
+      ? new Date(e.start.dateTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : e.start?.date || '?';
+    const end = e.end?.dateTime
+      ? new Date(e.end.dateTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : e.end?.date || '?';
+    const allDay = e.start?.date && !e.start?.dateTime;
+
+    console.log(`  ${e.summary || '(no title)'}`);
+    console.log(`    ID: ${e.id}`);
+    console.log(`    Time: ${allDay ? 'All day' : `${start} - ${end}`}`);
+    if (e.location) console.log(`    Location: ${e.location.displayName || e.location}`);
+    if (e.onlineMeetingUrl) console.log(`    Meeting: ${e.onlineMeetingUrl}`);
+    if (e.attendees?.length) {
+      const names = e.attendees.map((a) => a.displayName || a.id).join(', ');
+      console.log(`    Attendees: ${names}`);
+    }
+    console.log();
+  }
+}
+
+// ─── Calendar: Create event ──────────────────────────────────────────
+
+async function calendarCreate(summary, startStr, endStr, opts = {}) {
+  const { unionId } = await getOperator();
+  const calendarId = 'primary';
+  const tz = opts.tz || Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai';
+
+  const body = {
+    summary,
+    start: { dateTime: new Date(startStr).toISOString(), timeZone: tz },
+    end: { dateTime: new Date(endStr).toISOString(), timeZone: tz },
+  };
+  if (opts.location) {
+    body.location = { displayName: opts.location };
+  }
+  if (opts.description) {
+    body.description = opts.description;
+  }
+
+  const data = await api(
+    `/v1.0/calendar/users/${unionId}/calendars/${calendarId}/events`,
+    { method: 'POST', body: JSON.stringify(body) },
+  );
+  console.log(`Created event: ${summary}`);
+  if (data.id) console.log(`  ID: ${data.id}`);
+  console.log(`  Start: ${new Date(startStr).toLocaleString()}`);
+  console.log(`  End: ${new Date(endStr).toLocaleString()}`);
+}
+
+// ─── Calendar: Delete event ──────────────────────────────────────────
+
+async function calendarDelete(eventId) {
+  const { unionId } = await getOperator();
+  const calendarId = 'primary';
+  await api(
+    `/v1.0/calendar/users/${unionId}/calendars/${calendarId}/events/${eventId}`,
+    { method: 'DELETE' },
+  );
+  console.log(`Deleted event: ${eventId}`);
+}
+
+// ─── CLI ─────────────────────────────────────────────────────────────
+
+function fatal(msg) {
+  console.error(`Error: ${msg}`);
+  process.exit(1);
+}
+
+function parseOpts(args, flags) {
+  const opts = {};
+  for (const flag of flags) {
+    const idx = args.indexOf(`--${flag}`);
+    if (idx !== -1 && idx + 1 < args.length) {
+      opts[flag] = args[idx + 1];
+    }
+  }
+  return opts;
+}
+
+function usage() {
+  console.log(`Usage:
+  Todo:
+    dingtalk-work todo list                                   List pending todos
+    dingtalk-work todo list --done                            List completed todos
+    dingtalk-work todo create <subject> [--due <date>] [--priority <low|normal|important|urgent>] [--description <text>]
+    dingtalk-work todo complete <task_id>                     Mark todo as done
+    dingtalk-work todo delete <task_id>                       Delete a todo
+
+  Calendar:
+    dingtalk-work cal list [date]                             List events (default: today)
+    dingtalk-work cal create <summary> <start> <end> [--location <loc>] [--description <text>] [--tz <timezone>]
+    dingtalk-work cal delete <event_id>                       Delete an event
+
+  Date formats: "2025-03-15", "2025-03-15T14:00", ISO 8601
+
+Environment:
+  DINGTALK_APP_KEY       DingTalk app key (required)
+  DINGTALK_APP_SECRET    DingTalk app secret (required)`);
+  process.exit(0);
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (!args.length) usage();
+
+  const domain = args[0];
+  const cmd = args[1];
+
+  switch (domain) {
+    case 'todo': {
+      switch (cmd) {
+        case 'list': {
+          const done = args.includes('--done');
+          await todoList(done);
+          break;
+        }
+        case 'create': {
+          const subject = args[2];
+          if (!subject) fatal('Usage: dingtalk-work todo create <subject> [--due <date>] [--priority <p>] [--description <text>]');
+          const opts = parseOpts(args, ['due', 'priority', 'description']);
+          await todoCreate(subject, opts);
+          break;
+        }
+        case 'complete': {
+          const taskId = args[2];
+          if (!taskId) fatal('Usage: dingtalk-work todo complete <task_id>');
+          await todoComplete(taskId);
+          break;
+        }
+        case 'delete': {
+          const taskId = args[2];
+          if (!taskId) fatal('Usage: dingtalk-work todo delete <task_id>');
+          await todoDelete(taskId);
+          break;
+        }
+        default:
+          fatal(`Unknown todo command: ${cmd}\nRun "dingtalk-work help" for usage.`);
+      }
+      break;
+    }
+
+    case 'cal': {
+      switch (cmd) {
+        case 'list': {
+          await calendarList(args[2]);
+          break;
+        }
+        case 'create': {
+          const summary = args[2];
+          const start = args[3];
+          const end = args[4];
+          if (!summary || !start || !end) fatal('Usage: dingtalk-work cal create <summary> <start> <end> [--location <loc>]');
+          const opts = parseOpts(args, ['location', 'description', 'tz']);
+          await calendarCreate(summary, start, end, opts);
+          break;
+        }
+        case 'delete': {
+          const eventId = args[2];
+          if (!eventId) fatal('Usage: dingtalk-work cal delete <event_id>');
+          await calendarDelete(eventId);
+          break;
+        }
+        default:
+          fatal(`Unknown cal command: ${cmd}\nRun "dingtalk-work help" for usage.`);
+      }
+      break;
+    }
+
+    case 'help':
+    case '--help':
+    case '-h':
+      usage();
+      break;
+
+    default:
+      fatal(`Unknown domain: ${domain}\nRun "dingtalk-work help" for usage.`);
+  }
+}
+
+main().catch((err) => {
+  fatal(err.message || String(err));
+});

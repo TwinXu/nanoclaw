@@ -36,6 +36,7 @@ const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 const SKILL_REQUIRED_ENV: Record<string, string[]> = {
   'feishu-wiki': ['FEISHU_APP_ID', 'FEISHU_APP_SECRET'],
   'dingtalk-wiki': ['DINGTALK_APP_KEY', 'DINGTALK_APP_SECRET'],
+  'dingtalk-work': ['DINGTALK_APP_KEY', 'DINGTALK_APP_SECRET'],
 };
 
 export interface MediaAttachment {

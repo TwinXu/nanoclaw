@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// dingtalk-wiki — CLI tool to read DingTalk wiki / knowledge base content
+// dingtalk-wiki — CLI tool to read and write DingTalk wiki / knowledge base content
 // Uses v2.0 wiki API for workspaces/nodes, v1.0 doc API for document content
 // No npm dependencies; uses built-in fetch (Node 18+)
 
@@ -486,6 +486,206 @@ async function downloadFile(nodeId, outputDir) {
   console.log(`  Category: ${category}`);
 }
 
+// ─── Upload file to wiki (v2.0 storage API) ─────────────────────────
+
+async function uploadFile(parentNodeId, filePath) {
+  const fs = await import('fs');
+  const path = await import('path');
+
+  if (!fs.existsSync(filePath)) {
+    fatal(`File not found: ${filePath}`);
+  }
+
+  const operatorId = await getOperatorId();
+  const fileName = path.basename(filePath);
+  const fileSize = fs.statSync(filePath).size;
+
+  // Resolve parent node → storage spaceId + dentryId
+  const dentryInfo = await api(
+    `/v2.0/doc/dentries/${parentNodeId}/queryDentryId?operatorId=${operatorId}`,
+  );
+  const spaceId = dentryInfo.spaceId;
+  const parentDentryId = dentryInfo.dentryId;
+  if (!spaceId || !parentDentryId) {
+    fatal(`Cannot resolve storage IDs for node ${parentNodeId}`);
+  }
+
+  // Step 1: Get upload info via v1.0 storage API
+  // SDK: POST /v1.0/storage/spaces/{spaceId}/files/uploadInfos/query?unionId=...
+  const ticket = await api(
+    `/v1.0/storage/spaces/${spaceId}/files/uploadInfos/query?unionId=${operatorId}`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        multipart: false,
+        protocol: 'HEADER_SIGNATURE',
+      }),
+    },
+  );
+
+  const uploadKey = ticket.uploadKey;
+  const sigInfo = ticket.headerSignatureInfo || {};
+  const resourceUrls = sigInfo.resourceUrls || [];
+  const uploadUrl = resourceUrls[0];
+  if (!uploadKey || !uploadUrl) {
+    fatal(`No upload URL returned:\n${JSON.stringify(ticket, null, 2)}`);
+  }
+
+  // Step 2: Upload file content
+  const fileBuffer = fs.readFileSync(filePath);
+  const uploadHeaders = {};
+  if (sigInfo.headers) {
+    for (const [k, v] of Object.entries(sigInfo.headers)) {
+      uploadHeaders[k] = v;
+    }
+  }
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: uploadHeaders,
+    body: fileBuffer,
+  });
+  if (!uploadRes.ok) {
+    fatal(`Upload failed (${uploadRes.status}): ${await uploadRes.text()}`);
+  }
+
+  // Step 3: Commit file
+  // SDK: POST /v1.0/storage/spaces/{spaceId}/files/commit?unionId=...
+  const committed = await api(
+    `/v1.0/storage/spaces/${spaceId}/files/commit?unionId=${operatorId}`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        name: fileName,
+        parentId: parentDentryId,
+        uploadKey,
+      }),
+    },
+  );
+
+  const dentry = committed.dentry || committed;
+  console.log(`Uploaded: ${fileName}`);
+  console.log(`  Size: ${fileSize} bytes`);
+  if (dentry.id) console.log(`  Dentry ID: ${dentry.id}`);
+  if (dentry.spaceId) console.log(`  Space ID: ${dentry.spaceId}`);
+}
+
+// ─── Create document in wiki (v2.0 wiki API) ────────────────────────
+
+async function createDocument(parentNodeId, title) {
+  const operatorId = await getOperatorId();
+
+  // Get parent node to find workspaceId
+  const params = new URLSearchParams({
+    withPermissionRole: 'false',
+    operatorId,
+  });
+  const nodeData = await api(`/v2.0/wiki/nodes/${parentNodeId}?${params}`);
+  const parentNode = nodeData.node || nodeData;
+  const workspaceId = parentNode.workspaceId;
+  if (!workspaceId) {
+    fatal(`Cannot determine workspaceId for parent node ${parentNodeId}`);
+  }
+
+  const data = await api(`/v2.0/wiki/workspaces/${workspaceId}/nodes`, {
+    method: 'POST',
+    body: JSON.stringify({
+      operatorId,
+      parentNodeId,
+      name: title,
+      category: 'ALIDOC',
+    }),
+  });
+
+  const node = data.node || data;
+  console.log(`Created document: ${title}`);
+  if (node.nodeId) console.log(`  Node ID: ${node.nodeId}`);
+  if (node.docKey) console.log(`  Doc Key: ${node.docKey}`);
+  if (node.url) console.log(`  URL: ${node.url}`);
+}
+
+// ─── Create folder in wiki (v2.0 wiki API) ──────────────────────────
+
+async function createFolder(parentNodeId, name) {
+  const operatorId = await getOperatorId();
+
+  const params = new URLSearchParams({
+    withPermissionRole: 'false',
+    operatorId,
+  });
+  const nodeData = await api(`/v2.0/wiki/nodes/${parentNodeId}?${params}`);
+  const parentNode = nodeData.node || nodeData;
+  const workspaceId = parentNode.workspaceId;
+  if (!workspaceId) {
+    fatal(`Cannot determine workspaceId for parent node ${parentNodeId}`);
+  }
+
+  const data = await api(`/v2.0/wiki/workspaces/${workspaceId}/nodes`, {
+    method: 'POST',
+    body: JSON.stringify({
+      operatorId,
+      parentNodeId,
+      name,
+      category: 'FOLDER',
+    }),
+  });
+
+  const node = data.node || data;
+  console.log(`Created folder: ${name}`);
+  if (node.nodeId) console.log(`  Node ID: ${node.nodeId}`);
+  if (node.url) console.log(`  URL: ${node.url}`);
+}
+
+// ─── Write/append to document (v1.0 doc API) ────────────────────────
+
+async function writeDocument(nodeId, content, append) {
+  const operatorId = await getOperatorId();
+
+  // Resolve docKey from node
+  const params = new URLSearchParams({
+    withPermissionRole: 'false',
+    operatorId,
+  });
+  const nodeData = await api(`/v2.0/wiki/nodes/${nodeId}?${params}`);
+  const node = nodeData.node || nodeData;
+  const docKey = node.docKey || node.nodeId || nodeId;
+
+  if (append) {
+    // Insert blocks at end of document
+    // SDK: POST /v1.0/doc/documents/{documentId}/blocks
+    await api(`/v1.0/doc/documents/${docKey}/blocks`, {
+      method: 'POST',
+      body: JSON.stringify({
+        operatorId,
+        location: { head: false },
+        blocks: [{
+          blockType: 'PARAGRAPH',
+          paragraph: {
+            children: [{
+              elementType: 'TEXT_RUN',
+              text: { content },
+            }],
+          },
+        }],
+      }),
+    });
+    console.log(`Appended content to document ${node.name || nodeId}`);
+  } else {
+    // Overwrite entire document content
+    // SDK: POST /v1.0/doc/suites/documents/{docKey}/overwriteContent?operatorId=...
+    await api(
+      `/v1.0/doc/suites/documents/${docKey}/overwriteContent?operatorId=${operatorId}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          content,
+          dataType: 'MARKDOWN',
+        }),
+      },
+    );
+    console.log(`Wrote content to document ${node.name || nodeId}`);
+  }
+}
+
 // ─── Search (v1.0 doc API) ──────────────────────────────────────────
 
 async function searchDocs(keyword, workspaceId) {
@@ -525,6 +725,11 @@ function usage() {
   dingtalk-wiki nodes <parent_node_id>              List child nodes (use rootNodeId from spaces)
   dingtalk-wiki read <url_or_node_id>               Read document/file (auto-detects type)
   dingtalk-wiki download <url_or_node_id> [dir]     Download a file to dir (default: .)
+  dingtalk-wiki upload <parent_node_id> <file>      Upload a file to a wiki node
+  dingtalk-wiki create <parent_node_id> <title>     Create a new document
+  dingtalk-wiki mkdir <parent_node_id> <name>       Create a folder
+  dingtalk-wiki write <node_id> <text>              Overwrite document content
+  dingtalk-wiki append <node_id> <text>             Append to document
   dingtalk-wiki node <url_or_node_id>               Get node info (type, title, IDs)
   dingtalk-wiki search <keyword>                    Search documents by keyword
   dingtalk-wiki search <keyword> -w <workspace_id>  Search within a workspace
@@ -577,6 +782,48 @@ async function main() {
       if (!input) fatal('Usage: dingtalk-wiki node <url_or_node_id>');
       const parsed = parseUrlOrToken(input);
       await getNode(parsed.nodeId || input);
+      break;
+    }
+
+    case 'upload': {
+      const parentId = args[1];
+      const file = args[2];
+      if (!parentId || !file) fatal('Usage: dingtalk-wiki upload <parent_node_id> <file_path>');
+      await uploadFile(parentId, file);
+      break;
+    }
+
+    case 'create': {
+      const parentId = args[1];
+      const title = args[2];
+      if (!parentId || !title) fatal('Usage: dingtalk-wiki create <parent_node_id> <title>');
+      await createDocument(parentId, title);
+      break;
+    }
+
+    case 'mkdir': {
+      const parentId = args[1];
+      const name = args[2];
+      if (!parentId || !name) fatal('Usage: dingtalk-wiki mkdir <parent_node_id> <name>');
+      await createFolder(parentId, name);
+      break;
+    }
+
+    case 'write': {
+      const nid = args[1];
+      const text = args.slice(2).join(' ');
+      if (!nid || !text) fatal('Usage: dingtalk-wiki write <node_id> <text>');
+      const parsed2 = parseUrlOrToken(nid);
+      await writeDocument(parsed2.nodeId || nid, text, false);
+      break;
+    }
+
+    case 'append': {
+      const nid = args[1];
+      const text = args.slice(2).join(' ');
+      if (!nid || !text) fatal('Usage: dingtalk-wiki append <node_id> <text>');
+      const parsed2 = parseUrlOrToken(nid);
+      await writeDocument(parsed2.nodeId || nid, text, true);
       break;
     }
 
